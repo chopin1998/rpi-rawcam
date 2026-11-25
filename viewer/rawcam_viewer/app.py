@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         self._showing_still: bool = False
         self._still_frame: FramePacket | None = None
         self._latest_frame: FramePacket | None = None
+        self._applied_initial_1to1: bool = False
         self._last_status: dict[str, Any] = {}
         self._updating_ui = False
 
@@ -568,21 +569,25 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda s=scale: self.canvas.set_pixel_scale(s))
 
     def _fit_default_window_size(self) -> None:
-        """Size the window so the right control panel fits without a vertical scrollbar
-        and the canvas area starts close to the sensor's 16:9 aspect ratio."""
+        """Size the window so the canvas starts at 1:1 native scale (clamped to screen)
+        and the right control panel fits without a vertical scrollbar."""
         self._ctrl_panel.adjustSize()
         panel_h = self._ctrl_panel.sizeHint().height()
-        # Top toolbar + status bar + layout margins ≈ 92px
-        target_h = panel_h + 96
-        canvas_w = int(round((target_h - 96) * (1944.0 / 1096.0)))
-        target_w = canvas_w + self._ctrl_scroll.width() + 32
+        dpr = max(self.devicePixelRatioF(), 1.0)
+        chrome_w = self._ctrl_scroll.width() + 28
+        chrome_h = 92
+
+        canvas_w = int(round(1920.0 / dpr))
+        canvas_h = int(round(1096.0 / dpr))
+        target_w = canvas_w + chrome_w
+        target_h = max(canvas_h, panel_h) + chrome_h
 
         screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
-            target_h = min(target_h, int(avail.height() * 0.94))
-            target_w = min(target_w, int(avail.width() * 0.94))
-        self.resize(max(1280, target_w), max(780, target_h))
+            target_h = min(target_h, int(avail.height() * 0.96))
+            target_w = min(target_w, int(avail.width() * 0.96))
+        self.resize(max(960, target_w), max(780, target_h))
 
     # --- Log slider mapping for exposure (0.05 ms .. 500 ms) ---
     @staticmethod
@@ -672,6 +677,7 @@ class MainWindow(QMainWindow):
 
         self._apply_status_to_ui(st, sync_inputs=True)
         self._reset_stretch()
+        self._applied_initial_1to1 = False
 
         self._ctrl_worker = ControlWorker(self._ctrl, self)
         self._ctrl_worker.status_received.connect(self._apply_status_to_ui)
@@ -734,6 +740,9 @@ class MainWindow(QMainWindow):
             self._updating_ui = False
             self._update_display_params()
         self.canvas.set_frame(frame)
+        if not self._applied_initial_1to1:
+            self._applied_initial_1to1 = True
+            QTimer.singleShot(0, lambda: self._apply_scale_preset(1.0))
         if self._spot_job is not None:
             self._step_spot_auto(frame)
 
