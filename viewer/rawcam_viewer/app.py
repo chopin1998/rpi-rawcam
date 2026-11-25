@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -200,7 +201,12 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.fit_btn)
 
         self.one_to_one_btn = QPushButton("1:1")
-        self.one_to_one_btn.clicked.connect(lambda: self.canvas.set_zoom_1to1())
+        self.one_to_one_btn.setToolTip("Left-click: 1:1 native size (resizes window) | Right-click: 2:1 / 4:1 / 1:2 presets")
+        self.one_to_one_btn.clicked.connect(lambda: self._apply_scale_preset(1.0))
+        self.one_to_one_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.one_to_one_btn.customContextMenuRequested.connect(
+            lambda pos: self._show_scale_menu(self.one_to_one_btn.mapToGlobal(pos))
+        )
         top_bar.addWidget(self.one_to_one_btn)
 
         root.addLayout(top_bar)
@@ -211,6 +217,10 @@ class MainWindow(QMainWindow):
 
         self.canvas = RawGLCanvas()
         self.canvas.spot_clicked.connect(self._on_spot_clicked)
+        self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.canvas.customContextMenuRequested.connect(
+            lambda pos: self._show_scale_menu(self.canvas.mapToGlobal(pos))
+        )
         body.addWidget(self.canvas, stretch=1)
 
         scroll = QScrollArea()
@@ -500,6 +510,47 @@ class MainWindow(QMainWindow):
         self.stats_lbl = QLabel("")
         self.status_bar.addWidget(self.status_lbl, stretch=1)
         self.status_bar.addPermanentWidget(self.stats_lbl)
+
+    def _show_scale_menu(self, global_pos: QPoint) -> None:
+        menu = QMenu(self)
+        menu.addAction("Fit Window", lambda: self.canvas.reset_view())
+        menu.addSeparator()
+        menu.addAction("1:1 (100% Native)", lambda: self._apply_scale_preset(1.0))
+        menu.addAction("2:1 (200%)", lambda: self._apply_scale_preset(2.0))
+        menu.addAction("4:1 (400%)", lambda: self._apply_scale_preset(4.0))
+        menu.addSeparator()
+        menu.addAction("1:2 (50%)", lambda: self._apply_scale_preset(0.5))
+        menu.addAction("1:4 (25%)", lambda: self._apply_scale_preset(0.25))
+        menu.exec(global_pos)
+
+    def _apply_scale_preset(self, scale: float) -> None:
+        """Resize the window to match the requested pixel scale (clamped to screen),
+        then set exact GPU pixel scale so 1:1 fills the canvas at native resolution."""
+        img_w, img_h = self.canvas.image_size
+        if img_w <= 0 or img_h <= 0:
+            return
+        dpr = max(self.canvas.devicePixelRatioF(), 1.0)
+        desired_cw = int(round((img_w * scale) / dpr))
+        desired_ch = int(round((img_h * scale) / dpr))
+
+        chrome_w = max(self.width() - self.canvas.width(), self._ctrl_scroll.width() + 24)
+        chrome_h = max(self.height() - self.canvas.height(), 80)
+        min_panel_h = self._ctrl_panel.sizeHint().height() + chrome_h
+
+        target_w = desired_cw + chrome_w
+        target_h = desired_ch + chrome_h
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_w = int(avail.width() * 0.96)
+            max_h = int(avail.height() * 0.96)
+            target_w = min(target_w, max_w)
+            target_h = min(max(target_h, min(min_panel_h, max_h)), max_h)
+
+        self.resize(max(640, target_w), max(480, target_h))
+        # Apply exact pixel scale after layout updates canvas geometry
+        QTimer.singleShot(0, lambda s=scale: self.canvas.set_pixel_scale(s))
 
     def _fit_default_window_size(self) -> None:
         """Size the window so the right control panel fits without a vertical scrollbar

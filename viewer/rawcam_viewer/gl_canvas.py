@@ -255,20 +255,27 @@ class RawGLCanvas(QOpenGLWidget):
         self._colormap = int(colormap)
         self.update()
 
+    @property
+    def image_size(self) -> tuple[int, int]:
+        return self._img_w, self._img_h
+
     def reset_view(self) -> None:
         self._zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
         self.zoom_changed.emit(self._zoom)
         self.update()
 
-    def set_zoom_1to1(self) -> None:
+    def set_pixel_scale(self, scale: float) -> None:
+        """Set exact physical pixel ratio (e.g. 1.0 for 1:1, 2.0 for 2:1, 4.0 for 4:1)."""
         if self._img_w <= 0 or self._img_h <= 0:
             return
-        vw = max(self.width(), 1)
-        vh = max(self.height(), 1)
+        dpr = self.devicePixelRatioF()
+        vw = max(self.width() * dpr, 1.0)
+        vh = max(self.height() * dpr, 1.0)
         fit_scale = min(vw / self._img_w, vh / self._img_h)
-        self._zoom = max(1.0, 1.0 / max(fit_scale, 1e-6))
+        self._zoom = max(1.0, min(32.0, scale / max(fit_scale, 1e-6)))
         self._pan = QPointF(0.0, 0.0)
+        self._clamp_pan()
         self.zoom_changed.emit(self._zoom)
         self.update()
 
