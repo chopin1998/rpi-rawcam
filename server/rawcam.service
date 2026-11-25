@@ -1,0 +1,14 @@
+[Unit]
+Description=Raspberry Pi RAW Camera Streaming Service (rawcamd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/home/marco/build/imx462-camera.sh start
+ExecStart=/home/marco/rpi-rawcam/server/bin/rawcamd --ctrl-port 5600 --stream-port 5601 --snap-port 5602
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
