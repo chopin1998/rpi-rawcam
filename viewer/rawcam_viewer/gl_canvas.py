@@ -13,8 +13,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from .protocol import FramePacket, PixelFormat
 
-VERTEX_SHADER = """
-#version 330 core
+VERTEX_SHADER_BODY = """
 out vec2 v_uv;
 void main() {
     // Full-screen triangle (no VBO needed)
@@ -25,8 +24,7 @@ void main() {
 }
 """
 
-FRAGMENT_SHADER = """
-#version 330 core
+FRAGMENT_SHADER_BODY = """
 in vec2 v_uv;
 out vec4 frag_color;
 
@@ -175,12 +173,7 @@ class RawGLCanvas(QOpenGLWidget):
     spot_clicked = Signal(int, int)
 
     def __init__(self, parent=None) -> None:
-        fmt = QSurfaceFormat()
-        fmt.setVersion(3, 3)
-        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
-        fmt.setSwapInterval(0)  # Let incoming stream drive frame rate without artificial 60Hz stall
         super().__init__(parent)
-        self.setFormat(fmt)
         self.setMinimumSize(480, 320)
         self.setMouseTracking(True)
 
@@ -290,8 +283,23 @@ class RawGLCanvas(QOpenGLWidget):
 
     def initializeGL(self) -> None:
         try:
-            vs = self._compile_shader(VERTEX_SHADER, GL.GL_VERTEX_SHADER)
-            fs = self._compile_shader(FRAGMENT_SHADER, GL.GL_FRAGMENT_SHADER)
+            ctx = self.context()
+            is_gles = ctx.isOpenGLES() if ctx is not None else False
+            if is_gles:
+                vs_src = "#version 300 es\nprecision highp float;\n" + VERTEX_SHADER_BODY
+                fs_src = (
+                    "#version 300 es\n"
+                    "precision highp float;\n"
+                    "precision highp int;\n"
+                    "precision highp usampler2D;\n"
+                    + FRAGMENT_SHADER_BODY
+                )
+            else:
+                vs_src = "#version 330 core\n" + VERTEX_SHADER_BODY
+                fs_src = "#version 330 core\n" + FRAGMENT_SHADER_BODY
+
+            vs = self._compile_shader(vs_src, GL.GL_VERTEX_SHADER)
+            fs = self._compile_shader(fs_src, GL.GL_FRAGMENT_SHADER)
             prog = GL.glCreateProgram()
             GL.glAttachShader(prog, vs)
             GL.glAttachShader(prog, fs)

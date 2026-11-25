@@ -1021,10 +1021,12 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
-    # Request OpenGL 3.3 Core BEFORE creating QApplication (required on macOS/Windows/Wayland/NVIDIA)
+    # Only macOS requires requesting 3.3 Core explicitly; on Linux Wayland/EGL
+    # forcing 3.3 Core causes EGL_BAD_MATCH (3009). Let Qt negotiate native GL/GLES.
     fmt = QSurfaceFormat()
-    fmt.setVersion(3, 3)
-    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    if sys.platform == "darwin":
+        fmt.setVersion(3, 3)
+        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     fmt.setSwapInterval(0)
     QSurfaceFormat.setDefaultFormat(fmt)
 
