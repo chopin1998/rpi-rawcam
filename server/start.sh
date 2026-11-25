@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CAM_HELPER="${CAM_HELPER:-$HOME/build/imx462-camera.sh}"
+CAM_HELPER="${CAM_HELPER:-$SCRIPT_DIR/camera-driver.sh}"
 
 # Ensure camera driver & device tree overlay are loaded
 if ! ls /sys/bus/i2c/devices/*-003b/veye_mvcam >/dev/null 2>&1; then

@@ -18,13 +18,19 @@
 
 ### 1. 树莓派端
 
-确保摄像头驱动已加载（`start.sh` 默认会检查并调用 `~/build/imx462-camera.sh start`，也可以通过环境变量 `CAM_HELPER` 指定自己的加载脚本）：
+`server/camera-driver.sh` 负责加载/卸载内核驱动和设备树覆盖层（默认从 `~/build/raspberrypi_v4l2` 找编译好的 `.ko` 和 `.dtbo`，可通过 `VEYE_REPO` 环境变量指定路径），`start.sh` 启动前会自动检查并在需要时调用它：
 
 ```bash
 git clone https://github.com/chopin1998/rpi-rawcam.git ~/rpi-rawcam
 cd ~/rpi-rawcam/server
 make
 ./start.sh
+```
+
+手动管理驱动状态：
+
+```bash
+sudo ./camera-driver.sh status   # start / stop / status
 ```
 
 如果需要开机自启，可以把 `server/rawcam.service` 改好路径后装进 systemd：
@@ -35,9 +41,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rawcam
 ```
 
-### 2. 远程电脑端（Linux / Python 3.11+）
+### 2. 远程电脑端（Linux）
 
-使用 `uv` 安装依赖并运行：
+使用 `uv` 安装依赖并运行（不锁定 Python 版本，默认跟随系统或较新 Python）：
 
 ```bash
 git clone https://github.com/chopin1998/rpi-rawcam.git
