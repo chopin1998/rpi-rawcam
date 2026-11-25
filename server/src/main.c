@@ -344,6 +344,7 @@ static void *snap_client_thread(void *arg) {
     framebuf_init(&raw);
     bool ok = false;
 
+    char err[256] = { 0 };
     if (strcmp(cmd, "long_shot") == 0) {
         CameraStatus st;
         camera_get_status(cam, &st);
@@ -351,11 +352,13 @@ static void *snap_client_thread(void *arg) {
         double gain_db = st.target_gain_db;
         json_get_u32(req_line, "exposure_us", &exp_us);
         json_get_double(req_line, "gain_db", &gain_db);
-        char err[256] = { 0 };
         printf("[snap] long_shot exp=%.1fms gain=%.1fdB for %s\n", exp_us / 1000.0, gain_db, peer);
         fflush(stdout);
         ok = camera_capture_long_shot(cam, exp_us, gain_db, &raw, err, sizeof(err));
-        if (!ok) fprintf(stderr, "[snap] long_shot failed: %s\n", err);
+        if (err[0]) {
+            fprintf(stderr, "[snap] long shot: %s\n", err);
+            if (ok) raw.header.flags |= FLAG_RESTORE_WARNING;
+        }
     } else if (strcmp(cmd, "snap") == 0) {
         ok = camera_get_latest_raw_frame(cam, &raw);
     } else {
@@ -369,6 +372,12 @@ static void *snap_client_thread(void *arg) {
                raw.header.bit_depth, raw.header.width, raw.header.height,
                raw.header.exposure_us / 1000.0, peer);
         fflush(stdout);
+    }
+
+    if (err[0]) {
+        if (!ok) send_all(cfd, "ERR ", 4);
+        send_all(cfd, err, strlen(err));
+        send_all(cfd, "\n", 1);
     }
 
     framebuf_free(&raw);

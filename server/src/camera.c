@@ -438,76 +438,85 @@ static void refresh_hw_telemetry_locked(Camera *cam) {
     }
 }
 
-static void apply_adaptive_exposure_fps_locked(Camera *cam, bool *need_restart_for_fps) {
-    uint32_t max_fps_reg = 6000;
-    if (i2c_ctrl_read_u32(&cam->i2c, REG_MAX_FRAME_RATE, &max_fps_reg) && max_fps_reg > 0) {
-        cam->status.sensor_max_fps = max_fps_reg / 100.0;
-    }
-    uint32_t cur_fps_reg = 3000;
-    i2c_ctrl_read_u32(&cam->i2c, REG_FRAMERATE, &cur_fps_reg);
-    double cur_hw_fps = cur_fps_reg / 100.0;
-
-    double desired_fps = clamp_dbl(cam->status.target_fps, 0.1, cam->status.sensor_max_fps);
-    double effective_fps = desired_fps;
-    bool clamped = false;
-
-    uint32_t exp_us = clamp_u32(cam->status.target_exposure_us, 10u, 10000000u);
-    double exp_max_fps = 980000.0 / (double)exp_us;
-    if (exp_max_fps < desired_fps) {
-        effective_fps = exp_max_fps > 0.1 ? exp_max_fps : 0.1;
-        clamped = true;
-    }
-    uint32_t new_fps_reg = clamp_u32((uint32_t)llround(effective_fps * 100.0), 10u, max_fps_reg);
-
-    /* VEYE sensor locks Framerate register while streaming; request brief restart if FPS changes */
-    if (need_restart_for_fps && cam->status.streaming && new_fps_reg != cur_fps_reg) {
-        *need_restart_for_fps = true;
-        return;
-    }
-
-    i2c_ctrl_write_u32(&cam->i2c, REG_EXPOSURE_MODE, 2); /* Manual */
-    if (effective_fps < cur_hw_fps) {
-        i2c_ctrl_write_u32(&cam->i2c, REG_FRAMERATE, new_fps_reg);
-        usleep(8000);
-        i2c_ctrl_write_u32(&cam->i2c, REG_ME_TIME, exp_us);
-    } else {
-        i2c_ctrl_write_u32(&cam->i2c, REG_ME_TIME, exp_us);
-        usleep(8000);
-        i2c_ctrl_write_u32(&cam->i2c, REG_FRAMERATE, new_fps_reg);
-    }
-
-    cam->status.effective_fps = effective_fps;
-    cam->status.fps_clamped_by_exposure = clamped;
-    atomic_store(&cam->cached_fps_x100, new_fps_reg);
+static void append_error(char *err, size_t size, const char *message) {
+    size_t used = strlen(err);
+    if (used < size) snprintf(err + used, size - used, "%s%s", used ? "; " : "", message);
 }
 
-static bool apply_adaptive_with_restart(Camera *cam, char *err, size_t err_sz) {
-    pthread_mutex_lock(&cam->reconfig_mu);
+static bool write_gain_locked(Camera *cam, double gain_db) {
+    return i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2) &&
+           i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, (uint32_t)llround(gain_db * 10.0));
+}
 
-    bool need_restart = false;
-    pthread_mutex_lock(&cam->ctrl_mu);
-    apply_adaptive_exposure_fps_locked(cam, &need_restart);
-    if (!need_restart) {
-        refresh_hw_telemetry_locked(cam);
-        pthread_mutex_unlock(&cam->ctrl_mu);
-        pthread_mutex_unlock(&cam->reconfig_mu);
+static bool apply_timing_locked(Camera *cam, uint32_t exp_us, double target_fps,
+                                bool *need_restart, char *err, size_t err_sz) {
+    uint32_t max_reg, current_reg;
+    if (!i2c_ctrl_read_u32(&cam->i2c, REG_MAX_FRAME_RATE, &max_reg) || max_reg < 10 ||
+        !i2c_ctrl_read_u32(&cam->i2c, REG_FRAMERATE, &current_reg) || current_reg == 0) {
+        snprintf(err, err_sz, "I2C frame rate read failed");
+        return false;
+    }
+    cam->status.sensor_max_fps = max_reg / 100.0;
+    double desired = clamp_dbl(target_fps, 0.1, cam->status.sensor_max_fps);
+    double exposure_limit = 980000.0 / (double)exp_us;
+    double effective = clamp_dbl(exposure_limit, 0.1, desired);
+    uint32_t rate = clamp_u32((uint32_t)llround(effective * 100.0), 10u, max_reg);
+    if (need_restart && cam->status.streaming && rate != current_reg) {
+        *need_restart = true;
         return true;
     }
-    pthread_mutex_unlock(&cam->ctrl_mu);
 
-    bool was_running = atomic_load(&cam->running);
-    if (was_running) {
-        camera_stop_capture(cam);
-    }
+    /* Lower the rate before extending exposure. Shorten exposure before raising it. */
+    bool lower_rate = rate < current_reg;
+    if (!i2c_ctrl_write_u32(&cam->i2c, REG_EXPOSURE_MODE, 2) ||
+        !i2c_ctrl_write_u32(&cam->i2c, lower_rate ? REG_FRAMERATE : REG_ME_TIME,
+                            lower_rate ? rate : exp_us)) goto write_failed;
+    usleep(8000);
+    if (!i2c_ctrl_write_u32(&cam->i2c, lower_rate ? REG_ME_TIME : REG_FRAMERATE,
+                            lower_rate ? exp_us : rate)) goto write_failed;
 
+    cam->status.target_exposure_us = exp_us;
+    cam->status.target_fps = target_fps;
+    cam->status.effective_fps = rate / 100.0;
+    cam->status.fps_clamped_by_exposure = exposure_limit < desired;
+    atomic_store(&cam->cached_fps_x100, rate);
+    return true;
+
+write_failed:
+    snprintf(err, err_sz, "I2C write failed setting exposure/frame rate");
+    return false;
+}
+
+static bool update_timing(Camera *cam, uint32_t exp_us, double fps, char *err, size_t err_sz) {
+    pthread_mutex_lock(&cam->reconfig_mu);
     pthread_mutex_lock(&cam->ctrl_mu);
-    apply_adaptive_exposure_fps_locked(cam, NULL);
+    uint32_t old_exp = cam->status.target_exposure_us;
+    double old_fps = cam->status.target_fps;
+    if (!exp_us) exp_us = old_exp;
+    if (!fps) fps = old_fps;
+    bool restart = false;
+    bool ok = apply_timing_locked(cam, exp_us, fps, &restart, err, err_sz);
+    if (restart) {
+        pthread_mutex_unlock(&cam->ctrl_mu);
+        camera_stop_capture(cam);
+        pthread_mutex_lock(&cam->ctrl_mu);
+        ok = apply_timing_locked(cam, exp_us, fps, NULL, err, err_sz);
+    }
+    if (!ok) {
+        char rollback[128];
+        if (!apply_timing_locked(cam, old_exp, old_fps, NULL, rollback, sizeof(rollback))) {
+            append_error(err, err_sz, "previous exposure/frame rate could not be restored");
+        }
+    }
     refresh_hw_telemetry_locked(cam);
     pthread_mutex_unlock(&cam->ctrl_mu);
-
-    bool ok = true;
-    if (was_running) {
-        ok = camera_start_capture(cam, err, err_sz);
+    if (restart) {
+        char reason[128];
+        if (!camera_start_capture(cam, reason, sizeof(reason))) {
+            if (ok) snprintf(err, err_sz, "%s", reason);
+            else append_error(err, err_sz, reason);
+            ok = false;
+        }
     }
     pthread_mutex_unlock(&cam->reconfig_mu);
     return ok;
@@ -755,9 +764,12 @@ bool camera_init(Camera *cam, char *err, size_t err_sz) {
         return false;
     }
 
-    i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2);
-    i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, 0);
-    apply_adaptive_exposure_fps_locked(cam, NULL);
+    if (!write_gain_locked(cam, cam->status.target_gain_db)) {
+        snprintf(err, err_sz, "I2C write failed setting initial gain");
+        return false;
+    }
+    if (!apply_timing_locked(cam, cam->status.target_exposure_us, cam->status.target_fps,
+                             NULL, err, err_sz)) return false;
     refresh_hw_telemetry_locked(cam);
     return true;
 }
@@ -831,31 +843,22 @@ void camera_get_status(Camera *cam, CameraStatus *out) {
 
 bool camera_set_exposure(Camera *cam, const char *mode, uint32_t exposure_us, char *err, size_t err_sz) {
     (void)mode;
-    pthread_mutex_lock(&cam->ctrl_mu);
-    snprintf(cam->status.exposure_mode, sizeof(cam->status.exposure_mode), "manual");
-    if (exposure_us > 0) {
-        cam->status.target_exposure_us = clamp_u32(exposure_us, 10u, 10000000u);
-    }
-    pthread_mutex_unlock(&cam->ctrl_mu);
-    return apply_adaptive_with_restart(cam, err, err_sz);
+    if (exposure_us) exposure_us = clamp_u32(exposure_us, 10u, 10000000u);
+    return update_timing(cam, exposure_us, 0, err, err_sz);
 }
 
 bool camera_set_gain(Camera *cam, const char *mode, double gain_db, char *err, size_t err_sz) {
     (void)mode;
+    pthread_mutex_lock(&cam->reconfig_mu);
     pthread_mutex_lock(&cam->ctrl_mu);
-    snprintf(cam->status.gain_mode, sizeof(cam->status.gain_mode), "manual");
     double clamped = clamp_dbl(gain_db, 0.0, 48.0);
-    uint32_t gain_reg = (uint32_t)llround(clamped * 10.0);
-    if (!i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2) ||
-        !i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, gain_reg)) {
-        pthread_mutex_unlock(&cam->ctrl_mu);
-        snprintf(err, err_sz, "I2C write failed while setting gain");
-        return false;
-    }
-    cam->status.target_gain_db = clamped;
+    bool ok = write_gain_locked(cam, clamped);
+    if (ok) cam->status.target_gain_db = clamped;
+    else snprintf(err, err_sz, "I2C write failed while setting gain");
     refresh_hw_telemetry_locked(cam);
     pthread_mutex_unlock(&cam->ctrl_mu);
-    return true;
+    pthread_mutex_unlock(&cam->reconfig_mu);
+    return ok;
 }
 
 bool camera_set_fps(Camera *cam, double target_fps, char *err, size_t err_sz) {
@@ -863,10 +866,7 @@ bool camera_set_fps(Camera *cam, double target_fps, char *err, size_t err_sz) {
         snprintf(err, err_sz, "target_fps out of range");
         return false;
     }
-    pthread_mutex_lock(&cam->ctrl_mu);
-    cam->status.target_fps = target_fps;
-    pthread_mutex_unlock(&cam->ctrl_mu);
-    return apply_adaptive_with_restart(cam, err, err_sz);
+    return update_timing(cam, 0, target_fps, err, err_sz);
 }
 
 bool camera_set_format(Camera *cam, uint16_t bit_depth, uint32_t roi_x, uint32_t roi_y,
@@ -878,7 +878,8 @@ bool camera_set_format(Camera *cam, uint16_t bit_depth, uint32_t roi_x, uint32_t
     pthread_mutex_lock(&cam->ctrl_mu);
     bool ok = configure_pipeline_locked(cam, bit_depth, roi_x, roi_y, width, height, err, err_sz);
     if (ok) {
-        apply_adaptive_exposure_fps_locked(cam, NULL);
+        ok = apply_timing_locked(cam, cam->status.target_exposure_us, cam->status.target_fps,
+                                 NULL, err, err_sz);
         refresh_hw_telemetry_locked(cam);
     }
     pthread_mutex_unlock(&cam->ctrl_mu);
@@ -979,9 +980,12 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
     uint32_t ry = cam->status.roi_y;
     uint16_t bd = cam->status.bit_depth;
 
-    uint32_t max_fps_reg = 6000;
-    if (!i2c_ctrl_read_u32(&cam->i2c, REG_MAX_FRAME_RATE, &max_fps_reg) || max_fps_reg == 0) {
-        max_fps_reg = 6000;
+    err[0] = '\0';
+    uint32_t max_fps_reg;
+    if (!i2c_ctrl_read_u32(&cam->i2c, REG_MAX_FRAME_RATE, &max_fps_reg) || max_fps_reg < 10) {
+        snprintf(err, err_sz, "I2C frame rate read failed configuring long shot");
+        pthread_mutex_unlock(&cam->ctrl_mu);
+        goto restore;
     }
     double exp_fps = 980000.0 / (double)exposure_us;
     uint32_t fps_reg = clamp_u32((uint32_t)llround(exp_fps * 100.0), 10u, max_fps_reg);
@@ -993,8 +997,7 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
         usleep(10000);
         i2c_ok =
             i2c_ctrl_write_u32(&cam->i2c, REG_ME_TIME, exposure_us) &&
-            i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2) &&
-            i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, (uint32_t)llround(gain_db * 10.0));
+            write_gain_locked(cam, gain_db);
     }
     if (!i2c_ok) {
         snprintf(err, err_sz, "I2C write failed configuring long shot");
@@ -1075,10 +1078,11 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
 
         out->header = hdr;
         got = bytebuf_assign(&out->data, src, payload_size);
+        xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
         if (!got) {
             snprintf(err, err_sz, "Out of memory copying long-shot frame");
+            break;
         }
-        xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
     }
 
 restore:
@@ -1086,12 +1090,13 @@ restore:
     if (v4l2_started) {
         stop_v4l2_locked(cam);
     }
-    cam->status.target_exposure_us = saved_exp_us;
-    cam->status.target_gain_db = saved_gain_db;
-    cam->status.target_fps = saved_fps;
-    i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2);
-    i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, (uint32_t)llround(saved_gain_db * 10.0));
-    apply_adaptive_exposure_fps_locked(cam, NULL);
+    if (!write_gain_locked(cam, saved_gain_db)) {
+        append_error(err, err_sz, "live gain restore failed");
+    }
+    char timing_err[128];
+    if (!apply_timing_locked(cam, saved_exp_us, saved_fps, NULL, timing_err, sizeof(timing_err))) {
+        append_error(err, err_sz, "live exposure/frame rate restore failed");
+    }
     refresh_hw_telemetry_locked(cam);
     atomic_store(&cam->keyframe_req, true);
     pthread_mutex_unlock(&cam->ctrl_mu);
@@ -1099,10 +1104,8 @@ restore:
     if (was_running) {
         char restart_err[128] = { 0 };
         if (!camera_start_capture(cam, restart_err, sizeof(restart_err))) {
-            fprintf(stderr, "[error] Failed to restore live stream after long shot: %s\n", restart_err);
-            if (got) {
-                snprintf(err, err_sz, "Long shot captured, but live stream restore failed: %s", restart_err);
-            }
+            append_error(err, err_sz, "live stream restart failed");
+            append_error(err, err_sz, restart_err);
         }
     }
     pthread_mutex_unlock(&cam->reconfig_mu);

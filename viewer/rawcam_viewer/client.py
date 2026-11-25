@@ -13,7 +13,7 @@ from typing import Any
 import av
 from PySide6.QtCore import QThread, Signal
 
-from .protocol import FrameHeader, FramePacket, HEADER_STRUCT, PixelFormat
+from .protocol import FLAG_RESTORE_WARNING, FrameHeader, FramePacket, HEADER_STRUCT, PixelFormat
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -54,12 +54,30 @@ def grab_long_shot(host: str, exposure_us: int, gain_db: float, port: int = 5602
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(timeout)
         sock.sendall(req)
-        hdr_bytes = _recv_exact(sock, HEADER_STRUCT.size)
+        prefix = _recv_exact(sock, 4)
+        if prefix == b"ERR ":
+            raise RuntimeError(_read_shot_message(sock))
+        hdr_bytes = prefix + _recv_exact(sock, HEADER_STRUCT.size - len(prefix))
         hdr = FrameHeader.unpack(hdr_bytes)
         if hdr.payload_size <= 0 or hdr.payload_size > 32 * 1024 * 1024:
             raise ValueError(f"Invalid long-shot payload_size: {hdr.payload_size}")
         payload = _recv_exact(sock, hdr.payload_size)
-        return FramePacket(header=hdr, payload=payload)
+        warning = ""
+        if hdr.flags & FLAG_RESTORE_WARNING:
+            try:
+                warning = _read_shot_message(sock)
+            except (OSError, ValueError):
+                warning = "Live settings or stream could not be restored"
+        return FramePacket(header=hdr, payload=payload, restore_warning=warning)
+
+
+def _read_shot_message(sock: socket.socket) -> str:
+    with sock.makefile("rb") as reader:
+        line = reader.readline(512)
+    if not line.endswith(b"\n") or not line.strip():
+        raise ValueError("Incomplete single-shot status message")
+    return line.decode("utf-8", errors="replace").strip()
+
 
 
 class LongShotWorker(QThread):

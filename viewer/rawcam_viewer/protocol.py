@@ -27,6 +27,7 @@ class PixelFormat(IntEnum):
 FLAG_LOSSLESS = 1 << 0
 FLAG_PREVIEW = 1 << 1
 FLAG_KEYFRAME = 1 << 2
+FLAG_RESTORE_WARNING = 1 << 3
 
 
 @dataclass(slots=True)
@@ -89,6 +90,7 @@ class FrameHeader:
 class FramePacket:
     header: FrameHeader
     payload: bytes
+    restore_warning: str = ""
 
 
 def unpack_to_u16(frame: FramePacket) -> np.ndarray:

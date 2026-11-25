@@ -21,6 +21,9 @@ typedef enum {
 #define FLAG_LOSSLESS (1u << 0)
 #define FLAG_PREVIEW  (1u << 1)
 #define FLAG_KEYFRAME (1u << 2)
+/* Single shot: payload followed by a UTF-8 warning line. Without a frame,
+ * send "ERR " and the error line instead of a RAWC header. */
+#define FLAG_RESTORE_WARNING (1u << 3)
 
 typedef struct __attribute__((packed)) {
     char     magic[4];

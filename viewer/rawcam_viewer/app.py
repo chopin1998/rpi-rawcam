@@ -784,6 +784,8 @@ class MainWindow(QMainWindow):
             f"Still: {frame.header.width}×{frame.header.height} RAW{frame.header.bit_depth} "
             f"({exp_ms:.1f} ms, {gain_db:.1f} dB) — click 'Snap 12-bit Lossless' to save or 'Resume Live'"
         )
+        if frame.restore_warning:
+            msg = f"Still captured and available to save. Warning: {frame.restore_warning}"
         self.long_shot_lbl.setText(msg)
         self.status_lbl.setText(msg)
 
@@ -796,8 +798,8 @@ class MainWindow(QMainWindow):
         self._showing_still = False
         self._still_frame = None
         self.resume_live_btn.setEnabled(False)
-        self.long_shot_lbl.setText("Live stream resumed.")
-        self.status_lbl.setText("Live stream resumed")
+        self.long_shot_lbl.setText("Live view selected.")
+        self.status_lbl.setText("Live view selected")
 
     def _on_stats_updated(self, rx_fps: float, mb_s: float, dropped: int, decode_tag: str) -> None:
         if self._latest_frame is None:
