@@ -267,10 +267,31 @@ class RawGLCanvas(QOpenGLWidget):
         vw = max(self.width(), 1)
         vh = max(self.height(), 1)
         fit_scale = min(vw / self._img_w, vh / self._img_h)
-        self._zoom = max(0.1, 1.0 / max(fit_scale, 1e-6))
+        self._zoom = max(1.0, 1.0 / max(fit_scale, 1e-6))
         self._pan = QPointF(0.0, 0.0)
         self.zoom_changed.emit(self._zoom)
         self.update()
+
+    def _clamp_pan(self) -> None:
+        if self._zoom <= 1.0001 or self._img_w <= 0 or self._img_h <= 0:
+            self._pan = QPointF(0.0, 0.0)
+            return
+        vw = max(float(self.width()), 1.0)
+        vh = max(float(self.height()), 1.0)
+        view_aspect = vw / vh
+        img_aspect = float(self._img_w) / float(self._img_h)
+        if view_aspect > img_aspect:
+            vis_w = (view_aspect / img_aspect) / self._zoom
+            vis_h = 1.0 / self._zoom
+        else:
+            vis_w = 1.0 / self._zoom
+            vis_h = (img_aspect / view_aspect) / self._zoom
+        max_px = max(0.0, (1.0 - vis_w) * 0.5)
+        max_py = max(0.0, (1.0 - vis_h) * 0.5)
+        self._pan = QPointF(
+            max(-max_px, min(max_px, self._pan.x())),
+            max(-max_py, min(max_py, self._pan.y())),
+        )
 
     def _compile_shader(self, src: str, shader_type: int) -> int:
         sh = GL.glCreateShader(shader_type)
@@ -399,12 +420,19 @@ class RawGLCanvas(QOpenGLWidget):
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
         GL.glBindVertexArray(0)
 
+    def resizeGL(self, w: int, h: int) -> None:
+        self._clamp_pan()
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
         if delta == 0:
             return
         factor = math.pow(1.15, delta / 120.0)
-        self._zoom = max(0.2, min(32.0, self._zoom * factor))
+        new_zoom = max(1.0, min(32.0, self._zoom * factor))
+        if abs(new_zoom - self._zoom) < 1e-6:
+            return
+        self._zoom = new_zoom
+        self._clamp_pan()
         self.zoom_changed.emit(self._zoom)
         self.update()
 
@@ -415,20 +443,30 @@ class RawGLCanvas(QOpenGLWidget):
                 if pt is not None:
                     self.spot_clicked.emit(pt[0], pt[1])
                 return
-            self._dragging = True
-            self._drag_last = event.position()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._zoom > 1.0001:
+                self._dragging = True
+                self._drag_last = event.position()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._dragging and self._img_w > 0 and self._img_h > 0:
+        if self._dragging and self._zoom > 1.0001 and self._img_w > 0 and self._img_h > 0:
             cur = event.position()
-            dx = (cur.x() - self._drag_last.x()) / max(self.width(), 1)
-            dy = (cur.y() - self._drag_last.y()) / max(self.height(), 1)
+            vw = max(float(self.width()), 1.0)
+            vh = max(float(self.height()), 1.0)
+            view_aspect = vw / vh
+            img_aspect = float(self._img_w) / float(self._img_h)
+            dx = (cur.x() - self._drag_last.x()) / vw
+            dy = (cur.y() - self._drag_last.y()) / vh
+            if view_aspect > img_aspect:
+                dx *= view_aspect / img_aspect
+            else:
+                dy *= img_aspect / view_aspect
             self._drag_last = cur
             self._pan = QPointF(
                 self._pan.x() + dx / self._zoom,
                 self._pan.y() - dy / self._zoom,
             )
+            self._clamp_pan()
             self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:

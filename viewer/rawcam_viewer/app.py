@@ -47,13 +47,13 @@ DARK_STYLESHEET = """
 QMainWindow, QWidget {
     background-color: #16181d;
     color: #e4e7ec;
-    font-size: 13px;
+    font-size: 11pt;
 }
 QGroupBox {
     border: 1px solid #2b303b;
     border-radius: 6px;
-    margin-top: 10px;
-    padding: 10px 8px 8px 8px;
+    margin-top: 8px;
+    padding: 8px 8px 6px 8px;
     font-weight: 600;
     color: #a8b3cf;
 }
@@ -66,14 +66,14 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #1f232b;
     border: 1px solid #323846;
     border-radius: 4px;
-    padding: 4px 6px;
+    padding: 3px 6px;
     color: #f0f3f8;
 }
 QPushButton {
     background-color: #283040;
     border: 1px solid #3a4559;
     border-radius: 4px;
-    padding: 5px 10px;
+    padding: 4px 10px;
     color: #eef2f7;
 }
 QPushButton:hover {
@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
         self._spot_overlay_timer.timeout.connect(lambda: self.canvas.clear_spot_overlay())
 
         self._build_ui()
+        self._fit_default_window_size()
 
         # Debounced timers so dragging sliders doesn't flood I2C
         self._exp_timer = QTimer(self)
@@ -214,46 +215,48 @@ class MainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(340)
+        scroll.setFixedWidth(400)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._ctrl_scroll = scroll
 
         panel = QWidget()
+        self._ctrl_panel = panel
         pv = QVBoxLayout(panel)
         pv.setContentsMargins(2, 0, 6, 2)
-        pv.setSpacing(8)
+        pv.setSpacing(5)
 
         # 0. Spot Auto (One-Shot) Group
         spot_grp = QGroupBox("Spot Auto (One-Shot)")
         spot_form = QFormLayout(spot_grp)
+        spot_form.setVerticalSpacing(4)
+        spot_form.setContentsMargins(6, 4, 6, 4)
 
-        self.spot_pick_btn = QPushButton("Click Image to Auto-Tune (or Shift+Click)")
+        self.spot_pick_btn = QPushButton("Click Image to Auto-Tune (Shift+Click)")
         self.spot_pick_btn.setCheckable(True)
         self.spot_pick_btn.toggled.connect(self._on_spot_pick_toggled)
         spot_form.addRow(self.spot_pick_btn)
 
+        spot_row = QHBoxLayout()
         self.spot_target_combo = QComboBox()
-        self.spot_target_combo.addItem("Adjust Exposure", "exposure")
-        self.spot_target_combo.addItem("Adjust Gain", "gain")
-        self.spot_target_combo.addItem("Exposure First, then Gain", "exp_then_gain")
-        spot_form.addRow("Control:", self.spot_target_combo)
-
-        spot_params = QHBoxLayout()
+        self.spot_target_combo.addItem("Exposure", "exposure")
+        self.spot_target_combo.addItem("Gain", "gain")
+        self.spot_target_combo.addItem("Exp → Gain", "exp_then_gain")
         self.spot_pct_spin = QSpinBox()
         self.spot_pct_spin.setRange(5, 95)
         self.spot_pct_spin.setValue(50)
-        self.spot_pct_spin.setSuffix(" %")
+        self.spot_pct_spin.setSuffix("%")
         self.spot_rad_spin = QSpinBox()
         self.spot_rad_spin.setRange(4, 128)
         self.spot_rad_spin.setValue(32)
-        self.spot_rad_spin.setSuffix(" px")
-        spot_params.addWidget(QLabel("Target:"))
-        spot_params.addWidget(self.spot_pct_spin)
-        spot_params.addWidget(QLabel("R:"))
-        spot_params.addWidget(self.spot_rad_spin)
-        spot_form.addRow(spot_params)
+        self.spot_rad_spin.setSuffix("px")
+        spot_row.addWidget(self.spot_target_combo, stretch=1)
+        spot_row.addWidget(self.spot_pct_spin)
+        spot_row.addWidget(QLabel("R:"))
+        spot_row.addWidget(self.spot_rad_spin)
+        spot_form.addRow(spot_row)
 
-        self.spot_info_lbl = QLabel("Idle — Shift+Click any point on image")
-        self.spot_info_lbl.setStyleSheet("color: #98a2b3; font-size: 12px;")
+        self.spot_info_lbl = QLabel("Idle — Shift+Click any point")
+        self.spot_info_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
         self.spot_info_lbl.setWordWrap(True)
         spot_form.addRow(self.spot_info_lbl)
         pv.addWidget(spot_grp)
@@ -261,7 +264,10 @@ class MainWindow(QMainWindow):
         # 1. Live Video Exposure Group (<= 500 ms for smooth video streaming)
         exp_grp = QGroupBox("Live Exposure (≤ 500 ms)")
         exp_form = QFormLayout(exp_grp)
+        exp_form.setVerticalSpacing(4)
+        exp_form.setContentsMargins(6, 4, 6, 4)
 
+        exp_row = QHBoxLayout()
         self.exp_ms_spin = QDoubleSpinBox()
         self.exp_ms_spin.setRange(0.05, 500.0)
         self.exp_ms_spin.setDecimals(2)
@@ -269,7 +275,11 @@ class MainWindow(QMainWindow):
         self.exp_ms_spin.setSuffix(" ms")
         self.exp_ms_spin.setValue(10.0)
         self.exp_ms_spin.valueChanged.connect(self._on_exp_spin_changed)
-        exp_form.addRow("Exposure:", self.exp_ms_spin)
+        self.actual_exp_lbl = QLabel("HW: —")
+        self.actual_exp_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        exp_row.addWidget(self.exp_ms_spin)
+        exp_row.addWidget(self.actual_exp_lbl, stretch=1)
+        exp_form.addRow(exp_row)
 
         # Log-scaled slider: 0..1000 maps to 0.05 ms .. 500 ms
         self.exp_slider = QSlider(Qt.Orientation.Horizontal)
@@ -277,14 +287,13 @@ class MainWindow(QMainWindow):
         self.exp_slider.setValue(self._ms_to_slider(10.0))
         self.exp_slider.valueChanged.connect(self._on_exp_slider_changed)
         exp_form.addRow(self.exp_slider)
-
-        self.actual_exp_lbl = QLabel("—")
-        exp_form.addRow("Actual HW:", self.actual_exp_lbl)
         pv.addWidget(exp_grp)
 
         # 1b. Long Exposure Single Shot Group (> 500 ms, lossless 12-bit still)
         long_grp = QGroupBox("Long Exposure Single Shot (> 500 ms)")
         long_form = QFormLayout(long_grp)
+        long_form.setVerticalSpacing(4)
+        long_form.setContentsMargins(6, 4, 6, 4)
 
         long_row = QHBoxLayout()
         self.long_exp_spin = QDoubleSpinBox()
@@ -301,7 +310,7 @@ class MainWindow(QMainWindow):
         self.long_gain_spin.setValue(0.0)
         long_row.addWidget(self.long_exp_spin)
         long_row.addWidget(self.long_gain_spin)
-        long_form.addRow("Exp / Gain:", long_row)
+        long_form.addRow(long_row)
 
         long_btns = QHBoxLayout()
         self.long_shot_btn = QPushButton("Single Shot (12-bit)")
@@ -314,8 +323,8 @@ class MainWindow(QMainWindow):
         long_btns.addWidget(self.resume_live_btn)
         long_form.addRow(long_btns)
 
-        self.long_shot_lbl = QLabel("For >500 ms integration, captures one lossless RAW frame without slowing live stream.")
-        self.long_shot_lbl.setStyleSheet("color: #98a2b3; font-size: 11px;")
+        self.long_shot_lbl = QLabel("12-bit lossless still without slowing live stream")
+        self.long_shot_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
         self.long_shot_lbl.setWordWrap(True)
         long_form.addRow(self.long_shot_lbl)
         pv.addWidget(long_grp)
@@ -323,7 +332,10 @@ class MainWindow(QMainWindow):
         # 2. Adaptive Frame Rate Group
         fps_grp = QGroupBox("Frame Rate (Adaptive)")
         fps_form = QFormLayout(fps_grp)
+        fps_form.setVerticalSpacing(4)
+        fps_form.setContentsMargins(6, 4, 6, 4)
 
+        fps_row = QHBoxLayout()
         self.fps_spin = QDoubleSpinBox()
         self.fps_spin.setRange(0.5, 120.0)
         self.fps_spin.setDecimals(1)
@@ -331,7 +343,11 @@ class MainWindow(QMainWindow):
         self.fps_spin.setSuffix(" fps")
         self.fps_spin.setValue(30.0)
         self.fps_spin.valueChanged.connect(self._on_fps_spin_changed)
-        fps_form.addRow("Target FPS:", self.fps_spin)
+        self.eff_fps_lbl = QLabel("Eff: —")
+        self.eff_fps_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        fps_row.addWidget(self.fps_spin)
+        fps_row.addWidget(self.eff_fps_lbl, stretch=1)
+        fps_form.addRow(fps_row)
 
         self.fps_slider = QSlider(Qt.Orientation.Horizontal)
         self.fps_slider.setRange(1, 60)
@@ -339,52 +355,57 @@ class MainWindow(QMainWindow):
         self.fps_slider.valueChanged.connect(self._on_fps_slider_changed)
         fps_form.addRow(self.fps_slider)
 
-        self.eff_fps_lbl = QLabel("—")
-        fps_form.addRow("Effective / Max:", self.eff_fps_lbl)
-
         self.fps_clamp_lbl = QLabel("")
-        self.fps_clamp_lbl.setStyleSheet("color: #f59e0b; font-size: 12px;")
+        self.fps_clamp_lbl.setStyleSheet("color: #f59e0b; font-size: 9.5pt;")
         self.fps_clamp_lbl.setWordWrap(True)
+        self.fps_clamp_lbl.setVisible(False)
         fps_form.addRow(self.fps_clamp_lbl)
         pv.addWidget(fps_grp)
 
         # 3. Gain Group (Hardware is manual-only on VEYE RAW-MIPI)
         gain_grp = QGroupBox("Gain (Manual)")
         gain_form = QFormLayout(gain_grp)
+        gain_form.setVerticalSpacing(4)
+        gain_form.setContentsMargins(6, 4, 6, 4)
 
+        gain_row = QHBoxLayout()
         self.gain_spin = QDoubleSpinBox()
         self.gain_spin.setRange(0.0, 48.0)
         self.gain_spin.setDecimals(1)
         self.gain_spin.setSingleStep(0.5)
         self.gain_spin.setSuffix(" dB")
         self.gain_spin.valueChanged.connect(self._on_gain_spin_changed)
-        gain_form.addRow("Gain:", self.gain_spin)
+        self.actual_gain_lbl = QLabel("HW: —")
+        self.actual_gain_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        gain_row.addWidget(self.gain_spin)
+        gain_row.addWidget(self.actual_gain_lbl, stretch=1)
+        gain_form.addRow(gain_row)
 
         self.gain_slider = QSlider(Qt.Orientation.Horizontal)
         self.gain_slider.setRange(0, 480)
         self.gain_slider.valueChanged.connect(self._on_gain_slider_changed)
         gain_form.addRow(self.gain_slider)
-
-        self.actual_gain_lbl = QLabel("—")
-        gain_form.addRow("Actual HW:", self.actual_gain_lbl)
         pv.addWidget(gain_grp)
 
         # 4. Format & ROI Group
         fmt_grp = QGroupBox("Format & ROI")
         fmt_form = QFormLayout(fmt_grp)
+        fmt_form.setVerticalSpacing(4)
+        fmt_form.setContentsMargins(6, 4, 6, 4)
 
+        fmt_top = QHBoxLayout()
         self.bit_depth_combo = QComboBox()
-        self.bit_depth_combo.addItem("RAW12 (12-bit)", 12)
-        self.bit_depth_combo.addItem("RAW10 (10-bit)", 10)
-        fmt_form.addRow("Bit Depth:", self.bit_depth_combo)
-
+        self.bit_depth_combo.addItem("RAW12", 12)
+        self.bit_depth_combo.addItem("RAW10", 10)
         self.roi_preset_combo = QComboBox()
         self.roi_preset_combo.addItem("Full (1944×1096)", (0, 0, 1944, 1096))
-        self.roi_preset_combo.addItem("1080p Center (1920×1080)", (8, 8, 1920, 1080))
-        self.roi_preset_combo.addItem("720p Center (1280×720)", (328, 188, 1280, 720))
-        self.roi_preset_combo.addItem("VGA Center (640×480)", (648, 308, 640, 480))
+        self.roi_preset_combo.addItem("1080p (1920×1080)", (8, 8, 1920, 1080))
+        self.roi_preset_combo.addItem("720p (1280×720)", (328, 188, 1280, 720))
+        self.roi_preset_combo.addItem("VGA (640×480)", (648, 308, 640, 480))
         self.roi_preset_combo.currentIndexChanged.connect(self._apply_roi_preset)
-        fmt_form.addRow("Preset:", self.roi_preset_combo)
+        fmt_top.addWidget(self.bit_depth_combo)
+        fmt_top.addWidget(self.roi_preset_combo, stretch=1)
+        fmt_form.addRow(fmt_top)
 
         roi_xy = QHBoxLayout()
         self.roi_x_spin = QSpinBox()
@@ -393,13 +414,6 @@ class MainWindow(QMainWindow):
         self.roi_y_spin = QSpinBox()
         self.roi_y_spin.setRange(0, 792)
         self.roi_y_spin.setSingleStep(4)
-        roi_xy.addWidget(QLabel("X:"))
-        roi_xy.addWidget(self.roi_x_spin)
-        roi_xy.addWidget(QLabel("Y:"))
-        roi_xy.addWidget(self.roi_y_spin)
-        fmt_form.addRow("Offset:", roi_xy)
-
-        roi_wh = QHBoxLayout()
         self.roi_w_spin = QSpinBox()
         self.roi_w_spin.setRange(368, 1944)
         self.roi_w_spin.setSingleStep(8)
@@ -408,47 +422,60 @@ class MainWindow(QMainWindow):
         self.roi_h_spin.setRange(304, 1096)
         self.roi_h_spin.setSingleStep(4)
         self.roi_h_spin.setValue(1096)
+        roi_xy.addWidget(QLabel("X:"))
+        roi_xy.addWidget(self.roi_x_spin)
+        roi_xy.addWidget(QLabel("Y:"))
+        roi_xy.addWidget(self.roi_y_spin)
+        fmt_form.addRow(roi_xy)
+
+        roi_wh = QHBoxLayout()
         roi_wh.addWidget(QLabel("W:"))
         roi_wh.addWidget(self.roi_w_spin)
         roi_wh.addWidget(QLabel("H:"))
         roi_wh.addWidget(self.roi_h_spin)
-        fmt_form.addRow("Size:", roi_wh)
-
-        self.apply_fmt_btn = QPushButton("Apply Format / ROI")
+        self.apply_fmt_btn = QPushButton("Apply")
         self.apply_fmt_btn.clicked.connect(self._send_format)
-        fmt_form.addRow(self.apply_fmt_btn)
+        roi_wh.addWidget(self.apply_fmt_btn)
+        fmt_form.addRow(roi_wh)
         pv.addWidget(fmt_grp)
 
         # 5. GPU Display Stretch Group
         disp_grp = QGroupBox("GPU Display Stretch")
         disp_form = QFormLayout(disp_grp)
+        disp_form.setVerticalSpacing(4)
+        disp_form.setContentsMargins(6, 4, 6, 4)
 
+        bw_row = QHBoxLayout()
         self.black_spin = QSpinBox()
         self.black_spin.setRange(0, 4094)
         self.black_spin.setValue(0)
         self.black_spin.valueChanged.connect(self._update_display_params)
-        disp_form.addRow("Black Level:", self.black_spin)
-
         self.white_spin = QSpinBox()
         self.white_spin.setRange(1, 4095)
         self.white_spin.setValue(4095)
         self.white_spin.valueChanged.connect(self._update_display_params)
-        disp_form.addRow("White Level:", self.white_spin)
+        bw_row.addWidget(QLabel("Black:"))
+        bw_row.addWidget(self.black_spin, stretch=1)
+        bw_row.addWidget(QLabel("White:"))
+        bw_row.addWidget(self.white_spin, stretch=1)
+        disp_form.addRow(bw_row)
 
+        gc_row = QHBoxLayout()
         self.gamma_spin = QDoubleSpinBox()
         self.gamma_spin.setRange(0.2, 4.0)
         self.gamma_spin.setSingleStep(0.1)
         self.gamma_spin.setValue(1.0)
         self.gamma_spin.valueChanged.connect(self._update_display_params)
-        disp_form.addRow("Gamma:", self.gamma_spin)
-
         self.cmap_combo = QComboBox()
         self.cmap_combo.addItem("Grayscale", 0)
         self.cmap_combo.addItem("Inferno", 1)
         self.cmap_combo.addItem("Viridis", 2)
         self.cmap_combo.addItem("Jet", 3)
         self.cmap_combo.currentIndexChanged.connect(self._update_display_params)
-        disp_form.addRow("Colormap:", self.cmap_combo)
+        gc_row.addWidget(QLabel("γ:"))
+        gc_row.addWidget(self.gamma_spin)
+        gc_row.addWidget(self.cmap_combo, stretch=1)
+        disp_form.addRow(gc_row)
 
         stretch_btns = QHBoxLayout()
         self.auto_stretch_btn = QPushButton("Auto Stretch")
@@ -473,6 +500,23 @@ class MainWindow(QMainWindow):
         self.stats_lbl = QLabel("")
         self.status_bar.addWidget(self.status_lbl, stretch=1)
         self.status_bar.addPermanentWidget(self.stats_lbl)
+
+    def _fit_default_window_size(self) -> None:
+        """Size the window so the right control panel fits without a vertical scrollbar
+        and the canvas area starts close to the sensor's 16:9 aspect ratio."""
+        self._ctrl_panel.adjustSize()
+        panel_h = self._ctrl_panel.sizeHint().height()
+        # Top toolbar + status bar + layout margins ≈ 92px
+        target_h = panel_h + 96
+        canvas_w = int(round((target_h - 96) * (1944.0 / 1096.0)))
+        target_w = canvas_w + self._ctrl_scroll.width() + 32
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            target_h = min(target_h, int(avail.height() * 0.94))
+            target_w = min(target_w, int(avail.width() * 0.94))
+        self.resize(max(1280, target_w), max(780, target_h))
 
     # --- Log slider mapping for exposure (0.05 ms .. 500 ms) ---
     @staticmethod
@@ -895,21 +939,23 @@ class MainWindow(QMainWindow):
     def _apply_status_to_ui(self, st: dict[str, Any], sync_inputs: bool) -> None:
         self._last_status = st
         act_exp_us = st.get("actual_exposure_us", 0)
-        self.actual_exp_lbl.setText(f"{act_exp_us / 1000.0:.2f} ms ({act_exp_us} µs)")
-        self.actual_gain_lbl.setText(f"{st.get('actual_gain_db', 0.0):.1f} dB")
+        self.actual_exp_lbl.setText(f"HW: {act_exp_us / 1000.0:.2f} ms")
+        self.actual_gain_lbl.setText(f"HW: {st.get('actual_gain_db', 0.0):.1f} dB")
 
         eff_fps = st.get("effective_fps", 0.0)
         max_fps = st.get("sensor_max_fps", 60.0)
         meas_fps = st.get("measured_fps", 0.0)
-        self.eff_fps_lbl.setText(f"{eff_fps:.1f} / {max_fps:.1f} fps (cam {meas_fps:.1f})")
+        self.eff_fps_lbl.setText(f"Eff {eff_fps:.1f}/{max_fps:.0f} (cam {meas_fps:.1f})")
 
         if st.get("fps_clamped_by_exposure", False):
             self.fps_clamp_lbl.setText(
                 f"Clamped by exposure ({st.get('target_exposure_us', 0)/1000.0:.1f} ms). "
                 f"Will recover to {st.get('target_fps', 30.0):.1f} fps when exposure decreases."
             )
+            self.fps_clamp_lbl.setVisible(True)
         else:
             self.fps_clamp_lbl.setText("")
+            self.fps_clamp_lbl.setVisible(False)
 
         self.fps_slider.setMaximum(max(1, int(round(max_fps))))
 
