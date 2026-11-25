@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -515,13 +516,27 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("Fit Window", lambda: self.canvas.reset_view())
         menu.addSeparator()
-        menu.addAction("1:1 (100% Native)", lambda: self._apply_scale_preset(1.0))
-        menu.addAction("2:1 (200%)", lambda: self._apply_scale_preset(2.0))
-        menu.addAction("4:1 (400%)", lambda: self._apply_scale_preset(4.0))
+        for label, scale in [
+            ("0.5× (50%)", 0.5),
+            ("0.75× (75%)", 0.75),
+            ("1:1 (100% Native)", 1.0),
+            ("1.25× (125%)", 1.25),
+            ("1.5× (150%)", 1.5),
+            ("2× (200%)", 2.0),
+            ("3× (300%)", 3.0),
+            ("4× (400%)", 4.0),
+        ]:
+            menu.addAction(label, lambda _checked=False, s=scale: self._apply_scale_preset(s))
         menu.addSeparator()
-        menu.addAction("1:2 (50%)", lambda: self._apply_scale_preset(0.5))
-        menu.addAction("1:4 (25%)", lambda: self._apply_scale_preset(0.25))
+        menu.addAction("Custom Scale...", self._prompt_custom_scale)
         menu.exec(global_pos)
+
+    def _prompt_custom_scale(self) -> None:
+        val, ok = QInputDialog.getDouble(
+            self, "Custom Scale", "Pixel scale (e.g. 1.25, 1.5, 2.5):", 1.5, 0.25, 16.0, 2
+        )
+        if ok:
+            self._apply_scale_preset(val)
 
     def _apply_scale_preset(self, scale: float) -> None:
         """Resize the window to match the requested pixel scale (clamped to screen),
