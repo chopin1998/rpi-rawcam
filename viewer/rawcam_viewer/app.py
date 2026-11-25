@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
         self._still_frame: FramePacket | None = None
         self._latest_frame: FramePacket | None = None
         self._applied_initial_1to1: bool = False
+        self._shown_once: bool = False
         self._last_status: dict[str, Any] = {}
         self._updating_ui = False
 
@@ -568,21 +569,27 @@ class MainWindow(QMainWindow):
         # Apply exact pixel scale after layout updates canvas geometry
         QTimer.singleShot(0, lambda s=scale: self.canvas.set_pixel_scale(s))
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._shown_once:
+            self._shown_once = True
+            QTimer.singleShot(0, self._fit_default_window_size)
+
     def _fit_default_window_size(self) -> None:
         """Size the window so the canvas starts at 1:1 native scale (clamped to screen)
         and the right control panel fits without a vertical scrollbar."""
         self._ctrl_panel.adjustSize()
         panel_h = self._ctrl_panel.sizeHint().height()
-        dpr = max(self.devicePixelRatioF(), 1.0)
-        chrome_w = self._ctrl_scroll.width() + 28
-        chrome_h = 92
+        screen = self.screen() or QApplication.primaryScreen()
+        dpr = max(self.canvas.devicePixelRatioF(), 1.0)
+        chrome_w = max(self.width() - self.canvas.width(), self._ctrl_scroll.width() + 28) if self.canvas.width() > 0 else (self._ctrl_scroll.width() + 28)
+        chrome_h = max(self.height() - self.canvas.height(), 92) if self.canvas.height() > 0 else 92
 
         canvas_w = int(round(1920.0 / dpr))
         canvas_h = int(round(1096.0 / dpr))
         target_w = canvas_w + chrome_w
         target_h = max(canvas_h, panel_h) + chrome_h
 
-        screen = QApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
             target_h = min(target_h, int(avail.height() * 0.96))

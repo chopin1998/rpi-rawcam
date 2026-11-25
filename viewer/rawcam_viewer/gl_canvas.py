@@ -246,6 +246,8 @@ class RawGLCanvas(QOpenGLWidget):
 
     def set_frame(self, frame: FramePacket) -> None:
         self._pending_frame = frame
+        self._img_w = frame.header.width
+        self._img_h = frame.header.height
         self.update()
 
     def set_display_params(self, black: float, white: float, gamma: float, colormap: int) -> None:
