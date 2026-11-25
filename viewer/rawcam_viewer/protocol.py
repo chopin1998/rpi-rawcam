@@ -146,7 +146,7 @@ def save_frame(frame: FramePacket, path: str | Path) -> Path:
     if frame.header.pixel_format == PixelFormat.Y8_PREVIEW:
         img = Image.fromarray(arr.astype(np.uint8), mode="L")
     else:
-        # Preserve exact 10/12-bit integer values in 16-bit PNG/TIFF
-        img = Image.fromarray(arr, mode="I;16")
+        # Preserve exact 10/12-bit integer values in 16-bit PNG/TIFF (Pillow infers I;16 from uint16)
+        img = Image.fromarray(arr)
     img.save(out_path)
     return out_path

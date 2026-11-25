@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static atomic_bool g_stop = false;
@@ -283,6 +284,37 @@ static void *stream_client_thread(void *arg) {
     return NULL;
 }
 
+static bool recv_line(int fd, char *buf, size_t sz, int timeout_ms) {
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    size_t used = 0;
+
+    while (used + 1 < sz && !atomic_load(&g_stop)) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int elapsed = (int)((now.tv_sec - start.tv_sec) * 1000 +
+                            (now.tv_nsec - start.tv_nsec) / 1000000);
+        int rem = timeout_ms - elapsed;
+        if (rem <= 0) return false;
+
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        int pr = poll(&pfd, 1, rem);
+        if (pr <= 0) return false;
+
+        ssize_t n = recv(fd, buf + used, sz - 1 - used, 0);
+        if (n <= 0) return false;
+        used += (size_t)n;
+        buf[used] = '\0';
+
+        char *nl = strchr(buf, '\n');
+        if (nl) {
+            *nl = '\0';
+            return true;
+        }
+    }
+    return false;
+}
+
 static void *snap_client_thread(void *arg) {
     ClientArg *ca = (ClientArg *)arg;
     int cfd = ca->cfd;
@@ -295,18 +327,24 @@ static void *snap_client_thread(void *arg) {
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     char req_line[512] = { 0 };
-    struct pollfd pfd = { cfd, POLLIN, 0 };
-    if (poll(&pfd, 1, 80) > 0 && (pfd.revents & POLLIN)) {
-        ssize_t n = recv(cfd, req_line, sizeof(req_line) - 1, 0);
-        if (n > 0) req_line[n] = '\0';
+    if (!recv_line(cfd, req_line, sizeof(req_line), 2000)) {
+        fprintf(stderr, "[snap] missing or incomplete request line from %s\n", peer);
+        close(cfd);
+        return NULL;
+    }
+
+    char cmd[32] = { 0 };
+    if (!json_get_string(req_line, "cmd", cmd, sizeof(cmd))) {
+        fprintf(stderr, "[snap] invalid JSON request from %s: %s\n", peer, req_line);
+        close(cfd);
+        return NULL;
     }
 
     FrameBuffer raw;
     framebuf_init(&raw);
     bool ok = false;
-    char cmd[32] = { 0 };
 
-    if (json_get_string(req_line, "cmd", cmd, sizeof(cmd)) && strcmp(cmd, "long_shot") == 0) {
+    if (strcmp(cmd, "long_shot") == 0) {
         CameraStatus st;
         camera_get_status(cam, &st);
         uint32_t exp_us = st.target_exposure_us;
@@ -318,8 +356,10 @@ static void *snap_client_thread(void *arg) {
         fflush(stdout);
         ok = camera_capture_long_shot(cam, exp_us, gain_db, &raw, err, sizeof(err));
         if (!ok) fprintf(stderr, "[snap] long_shot failed: %s\n", err);
-    } else {
+    } else if (strcmp(cmd, "snap") == 0) {
         ok = camera_get_latest_raw_frame(cam, &raw);
+    } else {
+        fprintf(stderr, "[snap] unknown cmd '%s' from %s\n", cmd, peer);
     }
 
     if (ok) {

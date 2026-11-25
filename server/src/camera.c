@@ -842,14 +842,17 @@ bool camera_set_exposure(Camera *cam, const char *mode, uint32_t exposure_us, ch
 
 bool camera_set_gain(Camera *cam, const char *mode, double gain_db, char *err, size_t err_sz) {
     (void)mode;
-    (void)err;
-    (void)err_sz;
     pthread_mutex_lock(&cam->ctrl_mu);
     snprintf(cam->status.gain_mode, sizeof(cam->status.gain_mode), "manual");
-    cam->status.target_gain_db = clamp_dbl(gain_db, 0.0, 48.0);
-    uint32_t gain_reg = (uint32_t)llround(cam->status.target_gain_db * 10.0);
-    i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2);
-    i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, gain_reg);
+    double clamped = clamp_dbl(gain_db, 0.0, 48.0);
+    uint32_t gain_reg = (uint32_t)llround(clamped * 10.0);
+    if (!i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2) ||
+        !i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, gain_reg)) {
+        pthread_mutex_unlock(&cam->ctrl_mu);
+        snprintf(err, err_sz, "I2C write failed while setting gain");
+        return false;
+    }
+    cam->status.target_gain_db = clamped;
     refresh_hw_telemetry_locked(cam);
     pthread_mutex_unlock(&cam->ctrl_mu);
     return true;
@@ -962,6 +965,9 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
     bool was_running = atomic_load(&cam->running);
     if (was_running) camera_stop_capture(cam);
 
+    bool got = false;
+    bool v4l2_started = false;
+
     pthread_mutex_lock(&cam->ctrl_mu);
     uint32_t saved_exp_us = cam->status.target_exposure_us;
     double   saved_gain_db = cam->status.target_gain_db;
@@ -974,32 +980,38 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
     uint16_t bd = cam->status.bit_depth;
 
     uint32_t max_fps_reg = 6000;
-    i2c_ctrl_read_u32(&cam->i2c, REG_MAX_FRAME_RATE, &max_fps_reg);
+    if (!i2c_ctrl_read_u32(&cam->i2c, REG_MAX_FRAME_RATE, &max_fps_reg) || max_fps_reg == 0) {
+        max_fps_reg = 6000;
+    }
     double exp_fps = 980000.0 / (double)exposure_us;
     uint32_t fps_reg = clamp_u32((uint32_t)llround(exp_fps * 100.0), 10u, max_fps_reg);
 
-    i2c_ctrl_write_u32(&cam->i2c, REG_EXPOSURE_MODE, 2);
-    i2c_ctrl_write_u32(&cam->i2c, REG_FRAMERATE, fps_reg);
-    usleep(10000);
-    i2c_ctrl_write_u32(&cam->i2c, REG_ME_TIME, exposure_us);
-    i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2);
-    i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, (uint32_t)llround(gain_db * 10.0));
+    bool i2c_ok =
+        i2c_ctrl_write_u32(&cam->i2c, REG_EXPOSURE_MODE, 2) &&
+        i2c_ctrl_write_u32(&cam->i2c, REG_FRAMERATE, fps_reg);
+    if (i2c_ok) {
+        usleep(10000);
+        i2c_ok =
+            i2c_ctrl_write_u32(&cam->i2c, REG_ME_TIME, exposure_us) &&
+            i2c_ctrl_write_u32(&cam->i2c, REG_GAIN_MODE, 2) &&
+            i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, (uint32_t)llround(gain_db * 10.0));
+    }
+    if (!i2c_ok) {
+        snprintf(err, err_sz, "I2C write failed configuring long shot");
+        pthread_mutex_unlock(&cam->ctrl_mu);
+        goto restore;
+    }
+
     usleep(10000);
     refresh_hw_telemetry_locked(cam);
 
     if (!start_v4l2_locked(cam, err, err_sz)) {
-        cam->status.target_exposure_us = saved_exp_us;
-        cam->status.target_gain_db = saved_gain_db;
-        cam->status.target_fps = saved_fps;
-        i2c_ctrl_write_u32(&cam->i2c, REG_MANUAL_GAIN, (uint32_t)llround(saved_gain_db * 10.0));
-        apply_adaptive_exposure_fps_locked(cam, NULL);
         pthread_mutex_unlock(&cam->ctrl_mu);
-        pthread_mutex_unlock(&cam->reconfig_mu);
-        return false;
+        goto restore;
     }
+    v4l2_started = true;
     pthread_mutex_unlock(&cam->ctrl_mu);
 
-    bool got = false;
     uint64_t t_start = monotonic_ns();
     int timeout_ms = (int)(exposure_us / 1000) + 4000;
 
@@ -1030,12 +1042,14 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
         uint32_t payload_size = buf.bytesused < max_raw ? buf.bytesused : max_raw;
         uint64_t seq = atomic_fetch_add(&cam->frame_seq_counter, 1) + 1;
 
-        uint32_t hw_exp = exposure_us;
-        uint32_t hw_gain = (uint32_t)llround(gain_db * 10.0);
-        uint32_t hw_fps = 100;
-        i2c_ctrl_read_u32(&cam->i2c, REG_EXP_TIME, &hw_exp);
-        i2c_ctrl_read_u32(&cam->i2c, REG_CUR_GAIN, &hw_gain);
-        i2c_ctrl_read_u32(&cam->i2c, REG_FRAMERATE, &hw_fps);
+        uint32_t hw_exp = 0, hw_gain = 0, hw_fps = 0;
+        if (!i2c_ctrl_read_u32(&cam->i2c, REG_EXP_TIME, &hw_exp) ||
+            !i2c_ctrl_read_u32(&cam->i2c, REG_CUR_GAIN, &hw_gain) ||
+            !i2c_ctrl_read_u32(&cam->i2c, REG_FRAMERATE, &hw_fps)) {
+            xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
+            snprintf(err, err_sz, "I2C readback failed for long-shot exposure/gain metadata");
+            break;
+        }
 
         FrameHeader hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -1061,11 +1075,17 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
 
         out->header = hdr;
         got = bytebuf_assign(&out->data, src, payload_size);
+        if (!got) {
+            snprintf(err, err_sz, "Out of memory copying long-shot frame");
+        }
         xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
     }
 
+restore:
     pthread_mutex_lock(&cam->ctrl_mu);
-    stop_v4l2_locked(cam);
+    if (v4l2_started) {
+        stop_v4l2_locked(cam);
+    }
     cam->status.target_exposure_us = saved_exp_us;
     cam->status.target_gain_db = saved_gain_db;
     cam->status.target_fps = saved_fps;
@@ -1077,8 +1097,13 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
     pthread_mutex_unlock(&cam->ctrl_mu);
 
     if (was_running) {
-        char restart_err[128];
-        camera_start_capture(cam, restart_err, sizeof(restart_err));
+        char restart_err[128] = { 0 };
+        if (!camera_start_capture(cam, restart_err, sizeof(restart_err))) {
+            fprintf(stderr, "[error] Failed to restore live stream after long shot: %s\n", restart_err);
+            if (got) {
+                snprintf(err, err_sz, "Long shot captured, but live stream restore failed: %s", restart_err);
+            }
+        }
     }
     pthread_mutex_unlock(&cam->reconfig_mu);
     return got;
