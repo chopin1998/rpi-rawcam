@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import sys
 import threading
 import time
 from typing import Any
@@ -82,27 +84,41 @@ class LongShotWorker(QThread):
 
 
 class H264Decoder:
-    """Low-latency H.264 Annex-B decoder using AMD VA-API hardware decode when available."""
+    """Low-latency H.264 Annex-B decoder with cross-platform HW accel + safe SW fallback."""
 
     def __init__(self) -> None:
         self._codec = None
         self.hw_active = False
-        self._open()
+        self._hw_disabled = False
+        self._open(try_hw=True)
 
-    def _open(self) -> None:
+    def _open(self, try_hw: bool) -> None:
         self.hw_active = False
-        # Try VA-API hardware decoder first (AMD Radeon 780M /dev/dri/renderD128)
-        try:
-            from av.codec.hwaccel import HWAccel
+        if try_hw and not self._hw_disabled:
+            candidates: list[tuple[str, str | None]] = []
+            if sys.platform.startswith("linux") and os.path.exists("/dev/dri/renderD128"):
+                candidates.append(("vaapi", "/dev/dri/renderD128"))
+            elif sys.platform == "darwin":
+                candidates.append(("videotoolbox", None))
+            elif sys.platform == "win32":
+                candidates.append(("d3d11va", None))
 
-            hw = HWAccel(device_type="vaapi", device="/dev/dri/renderD128", allow_software_fallback=True)
-            ctx = av.CodecContext.create("h264", "r", hwaccel=hw)
-            ctx.flags |= av.codec.context.Flags.low_delay
-            self._codec = ctx
-            self.hw_active = True
-            return
-        except Exception:
-            pass
+            for dev_type, dev_path in candidates:
+                try:
+                    from av.codec.hwaccel import HWAccel
+
+                    hw = HWAccel(
+                        device_type=dev_type,
+                        device=dev_path,
+                        allow_software_fallback=False,
+                    )
+                    ctx = av.CodecContext.create("h264", "r", hwaccel=hw)
+                    ctx.flags |= av.codec.context.Flags.low_delay
+                    self._codec = ctx
+                    self.hw_active = True
+                    return
+                except Exception:
+                    continue
 
         # Fallback: multi-threaded software H.264 decoder
         ctx = av.CodecContext.create("h264", "r")
@@ -110,8 +126,10 @@ class H264Decoder:
         ctx.flags |= av.codec.context.Flags.low_delay
         self._codec = ctx
 
-    def reset(self) -> None:
-        self._open()
+    def reset(self, disable_hw: bool = False) -> None:
+        if disable_hw:
+            self._hw_disabled = True
+        self._open(try_hw=not self._hw_disabled)
 
     def decode_y8(self, nal_bytes: bytes) -> tuple[int, int, int, bytes] | None:
         """Decode one H.264 access unit and return (width, height, y_stride, y_bytes)."""
@@ -123,21 +141,29 @@ class H264Decoder:
         except av.error.InvalidDataError:
             return None
         except Exception:
-            self.reset()
-            return None
+            # If HW decode failed at runtime, permanently fall back to SW decode
+            if self.hw_active:
+                self.reset(disable_hw=True)
+                try:
+                    frames = self._codec.decode(pkt)
+                except Exception:
+                    return None
+            else:
+                self.reset(disable_hw=False)
+                return None
 
         if not frames:
             return None
         frame = frames[-1]
-        # Transfer from GPU VA-API surface to system memory if hardware-decoded
-        if frame.format.name == "vaapi":
-            frame = frame.to_ndarray(format="gray")
-            h, w = frame.shape
-            return w, h, w, frame.tobytes()
+        fmt_name = frame.format.name
+        if fmt_name in ("yuv420p", "yuvj420p", "nv12", "nv21", "gray"):
+            plane0 = frame.planes[0]
+            return frame.width, frame.height, plane0.line_size, bytes(plane0)
 
-        # Software / NV12 / YUV420P: plane 0 is already 8-bit monochrome Y!
-        plane0 = frame.planes[0]
-        return frame.width, frame.height, plane0.line_size, bytes(plane0)
+        # Hardware surface (vaapi / videotoolbox / d3d11 / etc.): download Y plane as gray
+        gray = frame.to_ndarray(format="gray")
+        h, w = gray.shape
+        return w, h, w, gray.tobytes()
 
 
 class ControlClient:

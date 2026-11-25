@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -1020,6 +1021,13 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    # Request OpenGL 3.3 Core BEFORE creating QApplication (required on macOS/Windows/Wayland/NVIDIA)
+    fmt = QSurfaceFormat()
+    fmt.setVersion(3, 3)
+    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    fmt.setSwapInterval(0)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLESHEET)
     win = MainWindow()

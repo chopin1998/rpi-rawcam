@@ -289,34 +289,39 @@ class RawGLCanvas(QOpenGLWidget):
         return sh
 
     def initializeGL(self) -> None:
-        vs = self._compile_shader(VERTEX_SHADER, GL.GL_VERTEX_SHADER)
-        fs = self._compile_shader(FRAGMENT_SHADER, GL.GL_FRAGMENT_SHADER)
-        prog = GL.glCreateProgram()
-        GL.glAttachShader(prog, vs)
-        GL.glAttachShader(prog, fs)
-        GL.glLinkProgram(prog)
-        if not GL.glGetProgramiv(prog, GL.GL_LINK_STATUS):
-            log = GL.glGetProgramInfoLog(prog).decode("utf-8", errors="replace")
-            raise RuntimeError(f"Program link error: {log}")
-        GL.glDeleteShader(vs)
-        GL.glDeleteShader(fs)
-        self._prog = prog
+        try:
+            vs = self._compile_shader(VERTEX_SHADER, GL.GL_VERTEX_SHADER)
+            fs = self._compile_shader(FRAGMENT_SHADER, GL.GL_FRAGMENT_SHADER)
+            prog = GL.glCreateProgram()
+            GL.glAttachShader(prog, vs)
+            GL.glAttachShader(prog, fs)
+            GL.glLinkProgram(prog)
+            if not GL.glGetProgramiv(prog, GL.GL_LINK_STATUS):
+                log = GL.glGetProgramInfoLog(prog).decode("utf-8", errors="replace")
+                raise RuntimeError(f"Program link error: {log}")
+            GL.glDeleteShader(vs)
+            GL.glDeleteShader(fs)
+            self._prog = prog
 
-        self._vao = GL.glGenVertexArrays(1)
-        self._tex = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._tex)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+            self._vao = GL.glGenVertexArrays(1)
+            self._tex = GL.glGenTextures(1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._tex)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
 
-        names = [
-            "u_tex", "u_fmt", "u_width", "u_height",
-            "u_black", "u_white", "u_gamma", "u_colormap",
-            "u_view_size", "u_pan", "u_zoom", "u_has_frame",
-            "u_spot_pos", "u_spot_rad",
-        ]
-        self._uniforms = {n: GL.glGetUniformLocation(self._prog, n) for n in names}
+            names = [
+                "u_tex", "u_fmt", "u_width", "u_height",
+                "u_black", "u_white", "u_gamma", "u_colormap",
+                "u_view_size", "u_pan", "u_zoom", "u_has_frame",
+                "u_spot_pos", "u_spot_rad",
+            ]
+            self._uniforms = {n: GL.glGetUniformLocation(self._prog, n) for n in names}
+        except Exception as exc:
+            import sys
+            print(f"[RawGLCanvas] OpenGL init failed: {exc}", file=sys.stderr)
+            self._prog = 0
 
     def _upload_pending_frame(self) -> None:
         frame = self._pending_frame
