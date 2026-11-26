@@ -4,21 +4,23 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QPoint, Qt, QTimer
-from PySide6.QtGui import QSurfaceFormat
+from PySide6.QtCore import QPoint, QSettings, QSize, Qt, QTimer, Slot
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut, QSurfaceFormat
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QToolButton,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -27,7 +29,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QScrollArea,
+    QStyle,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QStatusBar,
@@ -49,20 +52,17 @@ DARK_STYLESHEET = """
 QMainWindow, QWidget {
     background-color: #16181d;
     color: #e4e7ec;
-    font-size: 11pt;
 }
-QGroupBox {
-    border: 1px solid #2b303b;
-    border-radius: 6px;
-    margin-top: 8px;
-    padding: 8px 8px 6px 8px;
+QToolButton#sectionHeader {
+    background-color: #20242c;
+    border: 1px solid #333b49;
+    border-radius: 4px;
+    padding: 2px 6px;
     font-weight: 600;
     color: #a8b3cf;
 }
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
+QToolButton#sectionHeader:hover, QToolButton#sectionHeader:focus {
+    border-color: #558ae3;
 }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #1f232b;
@@ -92,6 +92,31 @@ QPushButton#primaryBtn {
 QPushButton#primaryBtn:hover {
     background-color: #1d4ed8;
 }
+QSlider:horizontal {
+    min-height: 26px;
+}
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #465268;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: #84baff;
+    border-radius: 3px;
+}
+QSlider#gainSlider::sub-page:horizontal { background: #70d6a9; }
+QSlider#fpsSlider::sub-page:horizontal { background: #f8be68; }
+QSlider::handle:horizontal {
+    width: 18px;
+    margin: -7px 0;
+    border: 2px solid #243247;
+    border-radius: 9px;
+    background: #f5f8ff;
+}
+QSlider::handle:horizontal:hover, QSlider::handle:horizontal:focus {
+    border-color: #558ae3;
+}
+QSlider::handle:horizontal:pressed { background: #c6e1ff; }
 QStatusBar {
     background-color: #111317;
     color: #98a2b3;
@@ -100,10 +125,198 @@ QStatusBar {
 """
 
 
+def diagonal_width_change(dx: float, dy: float, ratio: float) -> float:
+    """Project pointer motion onto a corner drag with a fixed image aspect."""
+    return (dx + dy / ratio) / (1 + 1 / ratio**2)
+
+
+class ResizeHandle(QWidget):
+    def __init__(self, window, horizontal, vertical):
+        super().__init__(window)
+        self.horizontal = horizontal
+        self.vertical = vertical
+        self.origin = None
+        if horizontal and vertical:
+            cursor = Qt.CursorShape.SizeFDiagCursor if horizontal == vertical else Qt.CursorShape.SizeBDiagCursor
+        else:
+            cursor = Qt.CursorShape.SizeHorCursor if horizontal else Qt.CursorShape.SizeVerCursor
+        self.setCursor(cursor)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.origin = event.globalPosition()
+            self.start = self.window().geometry()
+            self.window()._restore_geometry = None
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.origin is None or not event.buttons() & Qt.MouseButton.LeftButton:
+            return
+        window = self.window()
+        delta = event.globalPosition() - self.origin
+        dx, dy = delta.x() * self.horizontal, delta.y() * self.vertical
+        ratio = window.frame_ratio
+        if self.horizontal and self.vertical:
+            width_change = diagonal_width_change(dx, dy, ratio)
+        else:
+            width_change = dx if self.horizontal else dy * ratio
+        size = window.proportional_size(self.start.width() + width_change)
+        window.setFixedSize(size)
+        # Keep the opposite side stationary for left and top drags.
+        if self.horizontal < 0 or self.vertical < 0:
+            x = self.start.x() + (self.start.width() - size.width() if self.horizontal < 0 else 0)
+            y = self.start.y() + (self.start.height() - size.height() if self.vertical < 0 else 0)
+            window.move(x, y)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.origin = None
+            event.accept()
+
+
+class ShortcutResize(QWidget):
+    """Receive pointer movement across the screen until the resize is committed."""
+    def __init__(self, viewer):
+        super().__init__(viewer, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.viewer = viewer
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def begin(self) -> None:
+        if self.isVisible() or not self.viewer.isActiveWindow():
+            return
+        self.start_width = self.viewer.width()
+        self.previous_restore_geometry = self.viewer._restore_geometry
+        corner = self.viewer.corner_handle
+        self.origin = corner.mapToGlobal(corner.rect().center())
+        self.viewer._restore_geometry = None
+        self.setGeometry(self.viewer.screen().geometry())
+        self.show()
+        self.setFocus()
+        QCursor.setPos(self.origin)
+
+    def mouseMoveEvent(self, event):
+        delta = event.globalPosition() - self.origin
+        ratio = self.viewer.frame_ratio
+        dx = diagonal_width_change(delta.x(), delta.y(), ratio)
+        self.viewer._size_to_layout(self.start_width + dx)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        self.hide()
+        event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.viewer._size_to_layout(self.start_width)
+            self.viewer._restore_geometry = self.previous_restore_geometry
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            self.hide()
+        event.accept()
+
+
+class WindowTitle(QLabel):
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.window().windowHandle().startSystemMove()
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            window._toggle_maximized()
+            event.accept()
+
+
+class PreviewArea(QWidget):
+    def __init__(self, canvas, controls, groups):
+        super().__init__()
+        self.canvas = canvas
+        self.controls = controls
+        self.groups = groups
+        canvas.setParent(self)
+        canvas.setMinimumSize(1, 1)
+        controls.setParent(self)
+        self.headers = []
+        self.manually_closed = set()
+        self.preferred_group = None
+        grid = controls.layout()
+        for index, group in enumerate(groups):
+            header = QToolButton(controls)
+            header.setObjectName("sectionHeader")
+            header.setText(group.windowTitle().replace("&", "&&"))
+            header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            header.setCheckable(True)
+            header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            header.clicked.connect(lambda checked, i=index: self.toggle_group(i, checked))
+            self.headers.append(header)
+            grid.addWidget(header, index * 2, 0)
+            grid.addWidget(group, index * 2 + 1, 0)
+        self.column_width = 400
+
+    def toggle_group(self, index, expanded):
+        if expanded:
+            self.manually_closed.discard(index)
+            self.preferred_group = index
+        else:
+            self.manually_closed.add(index)
+            if self.preferred_group == index:
+                self.preferred_group = None
+        self.arrange()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.arrange()
+
+    def arrange(self) -> None:
+        w, h = self.width(), self.height()
+        grid = self.controls.layout()
+        margins = grid.contentsMargins()
+        spacing = grid.spacing()
+        width = self.column_width - margins.left() - margins.right()
+        heights = [max(group.minimumSizeHint().height(), group.heightForWidth(width))
+                   if group.hasHeightForWidth() else group.sizeHint().height()
+                   for group in self.groups]
+        header_height = (sum(header.sizeHint().height() for header in self.headers)
+                         + spacing * (len(self.headers) - 1) + margins.top() + margins.bottom())
+        costs = [height + spacing for height in heights]
+        # Even at minimum height, every title and any one requested group must fit.
+        self.setMinimumSize(self.column_width + 8 + 64, header_height + max(costs))
+        cw = max(1, w - self.column_width - 8)
+        self.canvas.setGeometry(0, 0, cw, h)
+        self.controls.setGeometry(cw + 8, 0, self.column_width, h)
+
+        expanded = set(range(len(self.groups))) - self.manually_closed
+        required = header_height + sum(costs[i] for i in expanded)
+        if required <= h:
+            self.preferred_group = None
+        for i in reversed(range(len(self.groups))):
+            if required <= h:
+                break
+            if i in expanded and i != self.preferred_group:
+                expanded.remove(i)
+                required -= costs[i]
+
+        for i, (header, group) in enumerate(zip(self.headers, self.groups)):
+            opened = i in expanded
+            header.setChecked(opened)
+            header.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow)
+            group.setVisible(opened)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("RAWCam Viewer (GPU Accelerated)")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.frame_ratio = 1944 / 1096
+        self._restore_geometry = None
+        self.resize_handles = []
         self.resize(1420, 860)
 
         self._ctrl = ControlClient()
@@ -113,7 +326,7 @@ class MainWindow(QMainWindow):
         self._showing_still: bool = False
         self._still_frame: FramePacket | None = None
         self._latest_frame: FramePacket | None = None
-        self._applied_initial_1to1: bool = False
+        self._layout_frame_size = None
         self._shown_once: bool = False
         self._last_status: dict[str, Any] = {}
         self._updating_ui = False
@@ -125,8 +338,22 @@ class MainWindow(QMainWindow):
         self._spot_overlay_timer.setInterval(3000)
         self._spot_overlay_timer.timeout.connect(lambda: self.canvas.clear_spot_overlay())
 
+        self._settings = QSettings("rawcam", "viewer")
         self._build_ui()
+        self._set_font_size(self._settings.value("fontPoints", 11, type=int))
         self._fit_default_window_size()
+        # KWin consumes its configured resize shortcut before Qt sees the key.
+        # Listen to that action without claiming or changing the desktop binding.
+        if sys.platform.startswith("linux"):
+            from PySide6.QtCore import SLOT
+            from PySide6.QtDBus import QDBusConnection
+            QDBusConnection.sessionBus().connect(
+                "org.kde.kglobalaccel", "/component/kwin", "org.kde.kglobalaccel.Component",
+                "globalShortcutPressed", self, SLOT("_desktop_shortcut(QString,QString,qlonglong)")
+            )
+        self.shortcut_resize = ShortcutResize(self)
+        self._resize_shortcut = QShortcut(QKeySequence("Meta+R"), self)
+        self._resize_shortcut.activated.connect(self._begin_shortcut_resize)
 
         # Debounced timers so dragging sliders doesn't flood I2C
         self._exp_timer = QTimer(self)
@@ -156,27 +383,39 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 6)
         root.setSpacing(6)
 
+        title_bar = QHBoxLayout()
+        title_bar.addWidget(WindowTitle(self.windowTitle()), stretch=1)
+        for label, icon, action in (
+            ("Minimize", QStyle.StandardPixmap.SP_TitleBarMinButton, self.showMinimized),
+            ("Maximize / Restore", QStyle.StandardPixmap.SP_TitleBarMaxButton, self._toggle_maximized),
+            ("Close", QStyle.StandardPixmap.SP_TitleBarCloseButton, self.close),
+        ):
+            button = QToolButton()
+            button.setIcon(self.style().standardIcon(icon))
+            button.setAccessibleName(label)
+            button.setToolTip(label)
+            button.clicked.connect(action)
+            title_bar.addWidget(button)
+        root.addLayout(title_bar)
+
         # --- Top connection bar ---
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
 
         top_bar.addWidget(QLabel("RPi IP:"))
         self.host_edit = QLineEdit("192.168.110.122")
-        self.host_edit.setFixedWidth(140)
         top_bar.addWidget(self.host_edit)
 
         top_bar.addWidget(QLabel("Ctrl:"))
         self.ctrl_port_spin = QSpinBox()
         self.ctrl_port_spin.setRange(1, 65535)
         self.ctrl_port_spin.setValue(5600)
-        self.ctrl_port_spin.setFixedWidth(72)
         top_bar.addWidget(self.ctrl_port_spin)
 
         top_bar.addWidget(QLabel("Stream:"))
         self.stream_port_spin = QSpinBox()
         self.stream_port_spin.setRange(1, 65535)
         self.stream_port_spin.setValue(5601)
-        self.stream_port_spin.setFixedWidth(72)
         top_bar.addWidget(self.stream_port_spin)
 
         self.connect_btn = QPushButton("Connect")
@@ -184,24 +423,41 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self._toggle_connect)
         top_bar.addWidget(self.connect_btn)
 
-        top_bar.addSpacing(12)
-        top_bar.addWidget(QLabel("Stream Mode:"))
+        top_bar.addStretch()
+        top_bar.addWidget(QLabel("Text size"))
+        self.font_smaller = QPushButton("−")
+        self.font_larger = QPushButton("+")
+        for button, step, title, keys in (
+            (self.font_smaller, -1, "Decrease text size", ["Ctrl+-"]),
+            (self.font_larger, 1, "Increase text size", ["Ctrl++", "Ctrl+="]),
+        ):
+            button.setAccessibleName(title)
+            button.setToolTip(f"{title} ({keys[0]})")
+            button.clicked.connect(lambda checked=False, delta=step: self._set_font_size(self._font_points + delta))
+            shortcut = QShortcut(self)
+            shortcut.setKeys([QKeySequence(key) for key in keys])
+            shortcut.activated.connect(button.click)
+            top_bar.addWidget(button)
+        root.addLayout(top_bar)
+
+        view_bar = QHBoxLayout()
+        view_bar.addWidget(QLabel("Stream Mode:"))
         self.stream_mode_combo = QComboBox()
         self.stream_mode_combo.addItem("Hardware H.264 Preview", "h264")
         self.stream_mode_combo.addItem("Lossless RAW (MIPI Packed)", "lossless")
         self.stream_mode_combo.addItem("8-bit Uncompressed Preview", "preview8")
         self.stream_mode_combo.currentIndexChanged.connect(self._on_stream_mode_changed)
-        top_bar.addWidget(self.stream_mode_combo)
+        view_bar.addWidget(self.stream_mode_combo)
 
         self.save_btn = QPushButton("Snap 12-bit Lossless")
         self.save_btn.setToolTip("Fetches a genuine full-resolution 10/12-bit lossless RAW frame from RPi (port 5602)")
         self.save_btn.clicked.connect(self._save_current_frame)
-        top_bar.addWidget(self.save_btn)
+        view_bar.addWidget(self.save_btn)
 
-        top_bar.addStretch()
+        view_bar.addStretch()
         self.fit_btn = QPushButton("Fit")
         self.fit_btn.clicked.connect(lambda: self.canvas.reset_view())
-        top_bar.addWidget(self.fit_btn)
+        view_bar.addWidget(self.fit_btn)
 
         self.one_to_one_btn = QPushButton("1:1")
         self.one_to_one_btn.setToolTip("Left-click: 1:1 native size (resizes window) | Right-click: 2:1 / 4:1 / 1:2 presets")
@@ -210,13 +466,11 @@ class MainWindow(QMainWindow):
         self.one_to_one_btn.customContextMenuRequested.connect(
             lambda pos: self._show_scale_menu(self.one_to_one_btn.mapToGlobal(pos))
         )
-        top_bar.addWidget(self.one_to_one_btn)
+        view_bar.addWidget(self.one_to_one_btn)
 
-        root.addLayout(top_bar)
+        root.addLayout(view_bar)
 
         # --- Main body: GPU Canvas + Right Controls ---
-        body = QHBoxLayout()
-        body.setSpacing(8)
 
         self.canvas = RawGLCanvas()
         self.canvas.spot_clicked.connect(self._on_spot_clicked)
@@ -224,22 +478,16 @@ class MainWindow(QMainWindow):
         self.canvas.customContextMenuRequested.connect(
             lambda pos: self._show_scale_menu(self.canvas.mapToGlobal(pos))
         )
-        body.addWidget(self.canvas, stretch=1)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(400)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        self._ctrl_scroll = scroll
 
         panel = QWidget()
-        self._ctrl_panel = panel
-        pv = QVBoxLayout(panel)
+        pv = QGridLayout(panel)
+        pv.setAlignment(Qt.AlignmentFlag.AlignTop)
         pv.setContentsMargins(2, 0, 6, 2)
         pv.setSpacing(5)
 
         # 0. Spot Auto (One-Shot) Group
-        spot_grp = QGroupBox("Spot Auto (One-Shot)")
+        spot_grp = QWidget()
+        spot_grp.setWindowTitle("Spot Auto (One-Shot)")
         spot_form = QFormLayout(spot_grp)
         spot_form.setVerticalSpacing(4)
         spot_form.setContentsMargins(6, 4, 6, 4)
@@ -269,13 +517,13 @@ class MainWindow(QMainWindow):
         spot_form.addRow(spot_row)
 
         self.spot_info_lbl = QLabel("Idle — Shift+Click any point")
-        self.spot_info_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        self.spot_info_lbl.setStyleSheet("color: #bdc6d6;")
         self.spot_info_lbl.setWordWrap(True)
         spot_form.addRow(self.spot_info_lbl)
-        pv.addWidget(spot_grp)
 
         # 1. Live Video Exposure Group (<= 500 ms for smooth video streaming)
-        exp_grp = QGroupBox("Live Exposure (≤ 500 ms)")
+        exp_grp = QWidget()
+        exp_grp.setWindowTitle("Live Exposure (≤ 500 ms)")
         exp_form = QFormLayout(exp_grp)
         exp_form.setVerticalSpacing(4)
         exp_form.setContentsMargins(6, 4, 6, 4)
@@ -289,7 +537,7 @@ class MainWindow(QMainWindow):
         self.exp_ms_spin.setValue(10.0)
         self.exp_ms_spin.valueChanged.connect(self._on_exp_spin_changed)
         self.actual_exp_lbl = QLabel("HW: —")
-        self.actual_exp_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        self.actual_exp_lbl.setStyleSheet("color: #bdc6d6;")
         exp_row.addWidget(self.exp_ms_spin)
         exp_row.addWidget(self.actual_exp_lbl, stretch=1)
         exp_form.addRow(exp_row)
@@ -299,11 +547,13 @@ class MainWindow(QMainWindow):
         self.exp_slider.setRange(0, 1000)
         self.exp_slider.setValue(self._ms_to_slider(10.0))
         self.exp_slider.valueChanged.connect(self._on_exp_slider_changed)
-        exp_form.addRow(self.exp_slider)
-        pv.addWidget(exp_grp)
+        self.exp_slider.setObjectName("expSlider")
+        self.exp_slider.setAccessibleName("Exposure (ms)")
+        exp_form.addRow("Exposure (ms)", self.exp_slider)
 
         # 1b. Long Exposure Single Shot Group (> 500 ms, lossless 12-bit still)
-        long_grp = QGroupBox("Long Exposure Single Shot (> 500 ms)")
+        long_grp = QWidget()
+        long_grp.setWindowTitle("Long Exposure Single Shot (> 500 ms)")
         long_form = QFormLayout(long_grp)
         long_form.setVerticalSpacing(4)
         long_form.setContentsMargins(6, 4, 6, 4)
@@ -337,13 +587,13 @@ class MainWindow(QMainWindow):
         long_form.addRow(long_btns)
 
         self.long_shot_lbl = QLabel("12-bit lossless still without slowing live stream")
-        self.long_shot_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        self.long_shot_lbl.setStyleSheet("color: #bdc6d6;")
         self.long_shot_lbl.setWordWrap(True)
         long_form.addRow(self.long_shot_lbl)
-        pv.addWidget(long_grp)
 
         # 2. Adaptive Frame Rate Group
-        fps_grp = QGroupBox("Frame Rate (Adaptive)")
+        fps_grp = QWidget()
+        fps_grp.setWindowTitle("Frame Rate (Adaptive)")
         fps_form = QFormLayout(fps_grp)
         fps_form.setVerticalSpacing(4)
         fps_form.setContentsMargins(6, 4, 6, 4)
@@ -357,7 +607,7 @@ class MainWindow(QMainWindow):
         self.fps_spin.setValue(30.0)
         self.fps_spin.valueChanged.connect(self._on_fps_spin_changed)
         self.eff_fps_lbl = QLabel("Eff: —")
-        self.eff_fps_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        self.eff_fps_lbl.setStyleSheet("color: #bdc6d6;")
         fps_row.addWidget(self.fps_spin)
         fps_row.addWidget(self.eff_fps_lbl, stretch=1)
         fps_form.addRow(fps_row)
@@ -366,17 +616,19 @@ class MainWindow(QMainWindow):
         self.fps_slider.setRange(1, 60)
         self.fps_slider.setValue(30)
         self.fps_slider.valueChanged.connect(self._on_fps_slider_changed)
-        fps_form.addRow(self.fps_slider)
+        self.fps_slider.setObjectName("fpsSlider")
+        self.fps_slider.setAccessibleName("Rate (fps)")
+        fps_form.addRow("Rate (fps)", self.fps_slider)
 
         self.fps_clamp_lbl = QLabel("")
-        self.fps_clamp_lbl.setStyleSheet("color: #f59e0b; font-size: 9.5pt;")
+        self.fps_clamp_lbl.setStyleSheet("color: #fbbf24;")
         self.fps_clamp_lbl.setWordWrap(True)
         self.fps_clamp_lbl.setVisible(False)
         fps_form.addRow(self.fps_clamp_lbl)
-        pv.addWidget(fps_grp)
 
         # 3. Gain Group (Hardware is manual-only on VEYE RAW-MIPI)
-        gain_grp = QGroupBox("Gain (Manual)")
+        gain_grp = QWidget()
+        gain_grp.setWindowTitle("Gain (Manual)")
         gain_form = QFormLayout(gain_grp)
         gain_form.setVerticalSpacing(4)
         gain_form.setContentsMargins(6, 4, 6, 4)
@@ -389,7 +641,7 @@ class MainWindow(QMainWindow):
         self.gain_spin.setSuffix(" dB")
         self.gain_spin.valueChanged.connect(self._on_gain_spin_changed)
         self.actual_gain_lbl = QLabel("HW: —")
-        self.actual_gain_lbl.setStyleSheet("color: #98a2b3; font-size: 9.5pt;")
+        self.actual_gain_lbl.setStyleSheet("color: #bdc6d6;")
         gain_row.addWidget(self.gain_spin)
         gain_row.addWidget(self.actual_gain_lbl, stretch=1)
         gain_form.addRow(gain_row)
@@ -397,11 +649,14 @@ class MainWindow(QMainWindow):
         self.gain_slider = QSlider(Qt.Orientation.Horizontal)
         self.gain_slider.setRange(0, 480)
         self.gain_slider.valueChanged.connect(self._on_gain_slider_changed)
-        gain_form.addRow(self.gain_slider)
-        pv.addWidget(gain_grp)
+        self.gain_slider.setObjectName("gainSlider")
+        self.gain_slider.setAccessibleName("Gain (dB)")
+        gain_form.addRow("Gain (dB)", self.gain_slider)
+
 
         # 4. Format & ROI Group
-        fmt_grp = QGroupBox("Format & ROI")
+        fmt_grp = QWidget()
+        fmt_grp.setWindowTitle("Format & ROI")
         fmt_form = QFormLayout(fmt_grp)
         fmt_form.setVerticalSpacing(4)
         fmt_form.setContentsMargins(6, 4, 6, 4)
@@ -450,10 +705,10 @@ class MainWindow(QMainWindow):
         self.apply_fmt_btn.clicked.connect(self._send_format)
         roi_wh.addWidget(self.apply_fmt_btn)
         fmt_form.addRow(roi_wh)
-        pv.addWidget(fmt_grp)
 
         # 5. GPU Display Stretch Group
-        disp_grp = QGroupBox("GPU Display Stretch")
+        disp_grp = QWidget()
+        disp_grp.setWindowTitle("GPU Display Stretch")
         disp_form = QFormLayout(disp_grp)
         disp_form.setVerticalSpacing(4)
         disp_form.setContentsMargins(6, 4, 6, 4)
@@ -499,12 +754,10 @@ class MainWindow(QMainWindow):
         stretch_btns.addWidget(self.reset_stretch_btn)
         disp_form.addRow(stretch_btns)
 
-        pv.addWidget(disp_grp)
-        pv.addStretch()
-
-        scroll.setWidget(panel)
-        body.addWidget(scroll)
-        root.addLayout(body, stretch=1)
+        self.preview = PreviewArea(self.canvas, panel, (exp_grp, gain_grp, fps_grp, long_grp,
+                                                         spot_grp, fmt_grp, disp_grp))
+        root.addWidget(self.preview, stretch=1)
+        self.preview.arrange()
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -513,6 +766,37 @@ class MainWindow(QMainWindow):
         self.stats_lbl = QLabel("")
         self.status_bar.addWidget(self.status_lbl, stretch=1)
         self.status_bar.addPermanentWidget(self.stats_lbl)
+        self.status_bar.setSizeGripEnabled(False)
+        # Wayland clients cannot position a top-level window. Only expose edges
+        # that can keep their opposite side anchored on that backend.
+        axes = (0, 1) if QApplication.platformName().startswith("wayland") else (-1, 0, 1)
+        for x in axes:
+            for y in axes:
+                if x or y:
+                    handle = ResizeHandle(self, x, y)
+                    self.resize_handles.append(handle)
+                    if x == y == 1:
+                        self.corner_handle = handle
+        self._place_resize_handles()
+
+    def _set_font_size(self, points: int) -> None:
+        self._font_points = max(8, min(20, points))
+        app = QApplication.instance()
+        font = app.font()
+        font.setPointSize(self._font_points)
+        app.setFont(font)
+        app.setStyleSheet(DARK_STYLESHEET + f"\nQWidget {{ font-size: {self._font_points}pt; }}")
+        self.font_smaller.setEnabled(self._font_points > 8)
+        self.font_larger.setEnabled(self._font_points < 20)
+        self.host_edit.setFixedWidth(self.host_edit.fontMetrics().horizontalAdvance("255.255.255.255") + 26)
+        self.preview.column_width = max(round(400 * self._font_points / 11),
+                                        max(g.minimumSizeHint().width() for g in self.preview.groups) + 28,
+                                        max(h.sizeHint().width() for h in self.preview.headers) + 8)
+        self.preview.arrange()
+        if self.isVisible():
+            self.centralWidget().layout().activate()
+            self._size_to_layout(self.width())
+        self._settings.setValue("fontPoints", self._font_points)
 
     def _show_scale_menu(self, global_pos: QPoint) -> None:
         menu = QMenu(self)
@@ -548,26 +832,8 @@ class MainWindow(QMainWindow):
             return
         dpr = max(self.canvas.devicePixelRatioF(), 1.0)
         desired_cw = int(round((img_w * scale) / dpr))
-        desired_ch = int(round((img_h * scale) / dpr))
-
-        chrome_w = max(self.width() - self.canvas.width(), self._ctrl_scroll.width() + 24)
-        chrome_h = max(self.height() - self.canvas.height(), 80)
-        min_panel_h = self._ctrl_panel.sizeHint().height() + chrome_h
-
-        target_w = desired_cw + chrome_w
-        target_h = desired_ch + chrome_h
-
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            max_w = int(avail.width() * 0.96)
-            max_h = int(avail.height() * 0.96)
-            target_w = min(target_w, max_w)
-            target_h = min(max(target_h, min(min_panel_h, max_h)), max_h)
-
-        self.resize(max(640, target_w), max(480, target_h))
-        # Apply exact pixel scale after layout updates canvas geometry
-        QTimer.singleShot(0, lambda s=scale: self.canvas.set_pixel_scale(s))
+        self._size_to_layout(desired_cw + self._fixed_chrome().width())
+        QTimer.singleShot(0, lambda: self.canvas.set_pixel_scale(scale))
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -576,25 +842,76 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._fit_default_window_size)
 
     def _fit_default_window_size(self) -> None:
-        """Size the window so the canvas starts at 1:1 native scale (clamped to screen)
-        and the right control panel fits without a vertical scrollbar."""
-        self._ctrl_panel.adjustSize()
-        panel_h = self._ctrl_panel.sizeHint().height()
-        screen = self.screen() or QApplication.primaryScreen()
         dpr = max(self.canvas.devicePixelRatioF(), 1.0)
-        chrome_w = max(self.width() - self.canvas.width(), self._ctrl_scroll.width() + 28) if self.canvas.width() > 0 else (self._ctrl_scroll.width() + 28)
-        chrome_h = max(self.height() - self.canvas.height(), 92) if self.canvas.height() > 0 else 92
+        self._size_to_layout(round(1944 / dpr) + self._fixed_chrome().width())
 
-        canvas_w = int(round(1920.0 / dpr))
-        canvas_h = int(round(1096.0 / dpr))
-        target_w = canvas_w + chrome_w
-        target_h = max(canvas_h, panel_h) + chrome_h
+    def _fixed_chrome(self) -> QSize:
+        outer = self.size() - self.preview.size() if self.isVisible() else QSize(16, 100)
+        return outer + QSize(self.preview.column_width + 8, 0)
 
-        if screen is not None:
-            avail = screen.availableGeometry()
-            target_h = min(target_h, int(avail.height() * 0.96))
-            target_w = min(target_w, int(avail.width() * 0.96))
-        self.resize(max(960, target_w), max(780, target_h))
+    def proportional_size(self, width: float) -> QSize:
+        fixed = self._fixed_chrome()
+        minimum = self.minimumSizeHint() - fixed
+        image_width = width - fixed.width()
+        if screen := self.screen():
+            area = screen.availableGeometry().size() - fixed
+            image_width = min(image_width, area.width(), area.height() * self.frame_ratio)
+        # Once either dimension reaches the controls' minimum, stop both together.
+        image_width = max(image_width, minimum.width(), minimum.height() * self.frame_ratio)
+        width_px = round(image_width)
+        return fixed + QSize(width_px, round(width_px / self.frame_ratio))
+
+    def _size_to_layout(self, width: float) -> None:
+        # Publish a single allowed size to the compositor. Desktop snap, session
+        # restore and external resize requests then use the same bounds as our grips.
+        self.setFixedSize(self.proportional_size(width))
+
+    def _toggle_maximized(self) -> None:
+        if self._restore_geometry is not None:
+            geometry = self._restore_geometry
+            self._restore_geometry = None
+            self._size_to_layout(geometry.width())
+            if not QApplication.platformName().startswith("wayland"):
+                self.move(geometry.topLeft())
+            return
+        self._restore_geometry = self.geometry()
+        area = self.screen().availableGeometry()
+        self._size_to_layout(area.width())
+        if not QApplication.platformName().startswith("wayland"):
+            self.move(area.center() - self.rect().center())
+
+    @Slot(str, str, "qlonglong")
+    def _desktop_shortcut(self, component, action, timestamp):
+        if component == "kwin" and action == "Window Resize" and self.isActiveWindow():
+            QTimer.singleShot(0, self._begin_shortcut_resize)
+
+    def _begin_shortcut_resize(self):
+        self.shortcut_resize.begin()
+
+    def _place_resize_handles(self) -> None:
+        w, h = self.width(), self.height()
+        edge, corner = 6, 14
+        for handle in self.resize_handles:
+            x, y = handle.horizontal, handle.vertical
+            thickness = corner if x and y else edge
+            left = (0 if x < 0 else w - thickness) if x else corner
+            top = (0 if y < 0 else h - thickness) if y else corner
+            handle.setGeometry(left, top, thickness if x else w - 2 * corner,
+                               thickness if y else h - 2 * corner)
+            handle.setVisible(not self.isMaximized() and not self.isFullScreen())
+            handle.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_resize_handles()
+
+    def _display_frame(self, frame: FramePacket) -> None:
+        dimensions = (frame.header.width, frame.header.height)
+        self.canvas.set_frame(frame)
+        if dimensions != self._layout_frame_size:
+            self._layout_frame_size = dimensions
+            self.frame_ratio = dimensions[0] / dimensions[1]
+            self._size_to_layout(self.width())
 
     # --- Log slider mapping for exposure (0.05 ms .. 500 ms) ---
     @staticmethod
@@ -682,9 +999,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Connection Error", f"Failed to connect to {host}:{cport}\n\n{exc}")
             return
 
+        self._layout_frame_size = None
         self._apply_status_to_ui(st, sync_inputs=True)
         self._reset_stretch()
-        self._applied_initial_1to1 = False
 
         self._ctrl_worker = ControlWorker(self._ctrl, self)
         self._ctrl_worker.status_received.connect(self._apply_status_to_ui)
@@ -746,10 +1063,7 @@ class MainWindow(QMainWindow):
             self.black_spin.setValue(0)
             self._updating_ui = False
             self._update_display_params()
-        self.canvas.set_frame(frame)
-        if not self._applied_initial_1to1:
-            self._applied_initial_1to1 = True
-            QTimer.singleShot(0, lambda: self._apply_scale_preset(1.0))
+        self._display_frame(frame)
         if self._spot_job is not None:
             self._step_spot_auto(frame)
 
@@ -793,7 +1107,7 @@ class MainWindow(QMainWindow):
         self._updating_ui = False
         self._update_display_params()
 
-        self.canvas.set_frame(frame)
+        self._display_frame(frame)
         exp_ms = frame.header.exposure_us / 1000.0
         gain_db = frame.header.gain_db_x10 / 10.0
         msg = (
@@ -1146,6 +1460,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", str(exc))
 
     def closeEvent(self, event) -> None:
+        self.shortcut_resize.hide()
         self._disconnect()
         super().closeEvent(event)
 
@@ -1160,8 +1475,11 @@ def main() -> None:
     fmt.setSwapInterval(0)
     QSurfaceFormat.setDefaultFormat(fmt)
 
+    # XWayland permits anchoring the opposite corner when dragging left/top.
+    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "xcb;wayland")
+    QApplication.setApplicationName("rawcam-viewer")
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_STYLESHEET)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
