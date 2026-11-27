@@ -1,14 +1,14 @@
+# systemd *user* unit for rawcamd. deploy.sh substitutes @REPO_ROOT@ and installs it to
+# ~/.config/systemd/user/rawcam.service. Manage with: systemctl --user {status|restart|stop} rawcam
 [Unit]
-Description=Raspberry Pi RAW Camera Streaming Service (rawcamd)
-After=network-online.target
-Wants=network-online.target
+Description=RAW Camera Streaming Service (rawcamd)
 
 [Service]
 Type=simple
-ExecStartPre=/home/marco/rpi-rawcam/server/camera-driver.sh start
-ExecStart=/home/marco/rpi-rawcam/server/bin/rawcamd --ctrl-port 5600 --stream-port 5601 --snap-port 5602
+ExecStartPre=@REPO_ROOT@/server/wait-camera.sh 60
+ExecStart=@REPO_ROOT@/server/bin/rawcamd --ctrl-port 5600 --stream-port 5601 --snap-port 5602
 Restart=on-failure
 RestartSec=3
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
