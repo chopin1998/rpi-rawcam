@@ -2,6 +2,8 @@
 # One-command setup & deployment for Raspberry Pi (Unicam) and RK3399 / ROCK Pi 4C (RKISP1).
 # Usage: ./deploy.sh [--no-service] [--force-driver] [--skip-apt]
 set -euo pipefail
+# modinfo / depmod / dtc live in sbin, which is not on a normal user's PATH
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_USER="${SUDO_USER:-$USER}"
