@@ -112,23 +112,38 @@ if is_rk3399; then
 fi
 
 # ---- Raspberry Pi (Unicam) path ----
+RELEASE="$(uname -r)"
 DEFAULT_VEYE_REPO="$OWNER_HOME/build/raspberrypi_v4l2"
 if [[ ! -d "$DEFAULT_VEYE_REPO" && -d "$REPO_ROOT/drivers/veye_raspberrypi_v4l2" ]]; then
     DEFAULT_VEYE_REPO="$REPO_ROOT/drivers/veye_raspberrypi_v4l2"
 fi
 VEYE_REPO="${VEYE_REPO:-$DEFAULT_VEYE_REPO}"
-MODULE_KO="${VEYE_KO:-$VEYE_REPO/driver_source/cam_drv_src/rpi-6.12.y/$MODULE.ko}"
-OVERLAY_DIR="${VEYE_DTS_DIR:-$VEYE_REPO/driver_source/dts/rpi-6.12.y}"
+if [[ -f "$REPO_ROOT/drivers/rpi/out/$RELEASE/$MODULE.ko" ]]; then
+    DEFAULT_KO="$REPO_ROOT/drivers/rpi/out/$RELEASE/$MODULE.ko"
+else
+    DEFAULT_KO="$VEYE_REPO/driver_source/cam_drv_src/rpi-6.12.y/$MODULE.ko"
+fi
+if [[ -f "$REPO_ROOT/drivers/rpi/out/$RELEASE/$MODULE.dtbo" ]]; then
+    DEFAULT_DTS_DIR="$REPO_ROOT/drivers/rpi/out/$RELEASE"
+else
+    DEFAULT_DTS_DIR="$VEYE_REPO/driver_source/dts/rpi-6.12.y"
+fi
+MODULE_KO="${VEYE_KO:-$DEFAULT_KO}"
+OVERLAY_DIR="${VEYE_DTS_DIR:-$DEFAULT_DTS_DIR}"
 
 overlay_active() { local o=("$OVERLAY_ROOT"/[0-9]*_"$MODULE"); (( ${#o[@]} > 0 )); }
 
 case "$1" in
     start)
         if ! module_loaded; then
-            ver=$(modinfo -F vermagic "$MODULE_KO") || die "Cannot read $MODULE_KO"
-            [[ "${ver%% *}" == "$(uname -r)" ]] || die "Rebuild $MODULE_KO for kernel $(uname -r) (found $ver)"
-            modprobe v4l2-fwnode
-            insmod "$MODULE_KO"
+            if modinfo "$MODULE" >/dev/null 2>&1; then
+                modprobe "$MODULE"
+            else
+                ver=$(modinfo -F vermagic "$MODULE_KO") || die "Cannot read $MODULE_KO (run ./deploy.sh first)"
+                [[ "${ver%% *}" == "$RELEASE" ]] || die "Rebuild $MODULE_KO for kernel $RELEASE (found $ver)"
+                modprobe v4l2-fwnode
+                insmod "$MODULE_KO"
+            fi
         fi
         if ! overlay_active && ! camera_present; then
             dtoverlay -d "$OVERLAY_DIR" "$MODULE"

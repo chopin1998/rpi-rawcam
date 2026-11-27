@@ -34,6 +34,7 @@
 
 ```text
 .
+├── deploy.sh                      # 新板子一键部署脚本（自动装依赖、编驱动、编服务、配 systemd）
 ├── server/                        # 板端纯 C11 服务 rawcamd（RPi / RK3399 通用）
 │   ├── src/                       # V4L2/Media 采集、H.264 & MJPEG 硬编、I2C 控制、TCP 服务
 │   ├── camera-driver.sh           # 自动识别平台加载/卸载驱动与设备树覆盖层
@@ -42,6 +43,7 @@
 ├── viewer/                        # PC 端 PySide6 + OpenGL 客户端（uv 管理依赖）
 └── drivers/
     ├── veye_raspberrypi_v4l2/     # Git Submodule：上游 veyeimaging/raspberrypi_v4l2
+    ├── rpi/                       # 树莓派驱动与 DT Overlay 自动编译脚本
     └── rk3399/                    # RK3399 主线内核补丁、DTS、编译/安装/回退脚本
 ```
 
@@ -60,33 +62,25 @@
 git clone --recurse-submodules https://github.com/chopin1998/rpi-rawcam.git ~/rpi-rawcam
 ```
 
-### 1. 板端启动（树莓派 / RK3399 通用）
+### 1. 板端一键部署（树莓派 / RK3399 通用）
 
-**RK3399 首次使用**需先编好树外驱动和 DT Overlay（不改原厂内核/DTB，可随时回退）：
+新板子拿到手，接好排线后直接跑两条命令即可（自动识别平台、装依赖、按当前内核编译并安装驱动/覆盖层、编译 `rawcamd`、配置开机自启服务）：
 
 ```bash
-cd ~/rpi-rawcam/drivers/rk3399
-./build.sh
-sudo ./install-persistent.sh     # 如需恢复原厂状态：sudo ./rollback.sh
+git clone --recurse-submodules https://github.com/chopin1998/rpi-rawcam.git ~/rpi-rawcam
+cd ~/rpi-rawcam
+./deploy.sh                      # 如不想装 systemd 服务：./deploy.sh --no-service
 ```
 
-> RK3399（ROCK Pi 4C）相机接口是 **J8203**（紧邻 Micro-HDMI 和 3.5 mm 耳机口），别插到对称的 J8204 DSI 屏接口上（两者 3.3V/GND 引脚一致，插错也能测到 3.3V 但 I2C4 无响应）。
+> **RK3399（ROCK Pi 4C）注意**：
+> - 相机接口是 **J8203**（紧邻 Micro-HDMI 和 3.5 mm 耳机口），别插到对称的 J8204 DSI 屏接口上（两者 3.3V/GND 引脚一致，插错也能测到 3.3V 但 I2C4 无响应）。
+> - RK3399 的驱动和 Overlay 采用树外安装，不替换原厂内核与基础 DTB，随时可一键恢复原厂状态：`sudo ./drivers/rk3399/rollback.sh`。
 
-驱动就绪后，树莓派和 RK3399 启动方式完全一致：
-
-```bash
-cd ~/rpi-rawcam/server
-make
-./start.sh
-```
-
-手动查驱动状态：`sudo ./camera-driver.sh status`（支持 `start | stop | status`）。  
-需要开机自启的话，按实际用户名和路径改一下 `server/rawcam.service` 装进 systemd：
+日常手动启停或查状态：
 
 ```bash
-sudo cp server/rawcam.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rawcam
+sudo ./server/camera-driver.sh status   # start | stop | status
+./server/start.sh                       # 前台手动启动 rawcamd
 ```
 
 ### 2. PC 客户端（Linux）

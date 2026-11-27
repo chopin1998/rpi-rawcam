@@ -10,6 +10,8 @@ build/
 server/bin/
 drivers/rk3399/.work-*/
 drivers/rk3399/out/
+drivers/rpi/.work-*/
+drivers/rpi/out/
 *.o
 *.log
 
