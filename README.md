@@ -1,13 +1,19 @@
 # rpi-rawcam
 
-用电脑通过局域网看 MIPI 相机画面、调曝光和增益，并保存 10/12 位无损原图。板端跑 C11 服务 `rawcamd`，桌面客户端用 PySide6 和 OpenGL。
+用电脑通过局域网看 MIPI 相机画面、调曝光和增益，并保存 10/12 位无损原图。板端用硬件编码预览，桌面端用 OpenGL 显示。
 
 两块板都用 VEYE `RAW-MIPI-IMX462M`（1944 × 1096，单色）做过实测。
 
-| 板子 | 硬件预览 | 无损格式 |
+| 板子 | 预览硬件编码 | 无损格式 |
 | --- | --- | --- |
-| Raspberry Pi 4B（Unicam） | H.264 | `Y10P` / `Y12P` |
-| ROCK Pi 4C（RK3399 主线内核） | MJPEG | `Y10` / `Y12` |
+| Raspberry Pi 4B（Unicam） | Broadcom VPU · H.264 | `Y10P` / `Y12P` |
+| ROCK Pi 4C（RK3399 主线内核） | Hantro VPU · MJPEG | `Y10` / `Y12` |
+
+## 硬件加速
+
+- 板端的 C11 服务 `rawcamd` 通过 V4L2 调用硬件编码器。树莓派这套相机的 H.264 预览居中裁到 1920 × 1088，无损原图仍是 1944 × 1096。
+- Linux 桌面端用 PyAV 解码。H.264 优先尝试 VA-API 硬解，驱动不支持时用软件解码。MJPEG 在板上硬编，在电脑上逐帧解码。
+- 客户端的 OpenGL 着色器直接在 GPU 上解包 RAW10/12，并处理黑白电平、Gamma、伪彩和缩放。
 
 ## 板端部署
 

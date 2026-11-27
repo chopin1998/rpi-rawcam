@@ -97,12 +97,19 @@ bool h264_enc_open(H264HwEncoder *e, uint32_t src_w, uint32_t src_h,
     uint32_t eh = (src_h > 1920 ? 1920 : src_h) & ~1u;
     if (ew < 32 || eh < 32) return false;
 
+    /* The firmware accepts larger formats but can corrupt their bitstreams.
+     * Stay within the macroblock budget of 1920x1080 (120 x 68 padded blocks).
+     */
+    const uint32_t blocks_per_row = (ew + 15) / 16;
+    const uint32_t max_height = (120u * 68u / blocks_per_row) * 16;
+    if (eh > max_height) eh = max_height;
+
     e->fd = open(dev_path ? dev_path : "/dev/video11", O_RDWR | O_NONBLOCK);
     if (e->fd < 0) return false;
     e->enc_w = ew;
     e->enc_h = eh;
 
-    /* Configure codec controls (Level 4.2 supports 1920x1096 macroblock count) */
+    /* Set the profile, level, bitrate and keyframe interval. */
     set_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
     set_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_BITRATE, (int32_t)bitrate);
     set_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_GOP_SIZE, (int32_t)gop);

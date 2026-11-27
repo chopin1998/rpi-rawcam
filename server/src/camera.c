@@ -926,7 +926,8 @@ static void *capture_loop(void *arg) {
             if (atomic_exchange(&cam->keyframe_req, false)) {
                 h264_enc_force_keyframe(&cam->h264_enc);
             }
-            PreviewFillCtx fctx = { src, stride, w, bd, cam->backend };
+            uint32_t top = (h - cam->h264_enc.enc_h) / 2;
+            PreviewFillCtx fctx = { src + (size_t)top * stride, stride, w, bd, cam->backend };
             bool is_kf = false;
             size_t nal_len = 0;
             if (h264_enc_encode(&cam->h264_enc, fill_y_for_preview, &fctx,
