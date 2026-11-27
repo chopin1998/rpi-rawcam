@@ -3,6 +3,7 @@
 
 #include "h264_enc.h"
 #include "i2c_ctrl.h"
+#include "mjpeg_enc.h"
 #include "protocol.h"
 
 #include <pthread.h>
@@ -33,6 +34,8 @@ void framebuf_init(FrameBuffer *f);
 void framebuf_free(FrameBuffer *f);
 
 typedef struct {
+    char     platform[16];     /* "rpi" or "rk3399" */
+    char     sensor_type[16];  /* "mono" or "bayer" */
     char     camera_model[64];
     char     video_dev[64];
     char     subdev_dev[64];
@@ -42,6 +45,7 @@ typedef struct {
     uint32_t sensor_height;
     uint32_t min_roi_width;
     uint32_t min_roi_height;
+    uint32_t format_cap_mask;  /* VEYE REG_FORMAT_CAP bitmask: bit1=10bit, bit2=12bit */
 
     uint16_t bit_depth;        /* 10 or 12 */
     uint32_t roi_x;
@@ -49,7 +53,9 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t stride;
-    char     stream_mode[16];  /* "h264", "lossless", or "preview8" */
+    char     stream_mode[16];  /* "h264", "mjpeg", "lossless", or "preview8" */
+    bool     h264_supported;
+    bool     mjpeg_supported;
 
     char     exposure_mode[16];
     uint32_t target_exposure_us;
@@ -75,11 +81,22 @@ typedef struct {
     size_t length;
 } CamMmapBuf;
 
+typedef enum {
+    CAM_BACKEND_UNICAM = 0,
+    CAM_BACKEND_RKISP1 = 1,
+} CamBackend;
+
 typedef struct {
+    CamBackend     backend;
     int            video_fd;
     int            subdev_fd;
+    char           media_dev[64];
+    char           csi_subdev[64];
+    char           isp_subdev[64];
+    char           rsz_mp_subdev[64];
     I2cCtrl        i2c;
     H264HwEncoder  h264_enc;
+    MjpegHwEncoder mjpeg_enc;
 
     CamMmapBuf     buffers[CAM_MAX_MMAP_BUFS];
     uint32_t       buf_count;
@@ -110,7 +127,7 @@ typedef struct {
     atomic_uint_fast32_t cached_exp_us;
     atomic_uint_fast32_t cached_gain_x10;
     atomic_uint_fast32_t cached_fps_x100;
-    atomic_int           stream_mode_id; /* 0=lossless, 1=preview8, 2=h264 */
+    atomic_int           stream_mode_id; /* 0=lossless, 1=preview8, 2=h264, 3=mjpeg */
     atomic_bool          keyframe_req;
 } Camera;
 

@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/media.h>
 #include <linux/media-bus-format.h>
 #include <linux/v4l2-subdev.h>
 #include <linux/videodev2.h>
@@ -20,9 +21,10 @@
 #include <arm_neon.h>
 #endif
 
-#define V4L2_CID_VEYE_MV_BASE  (V4L2_CID_USER_BASE + 0x1000)
-#define V4L2_CID_VEYE_MV_ROI_X (V4L2_CID_VEYE_MV_BASE + 5)
-#define V4L2_CID_VEYE_MV_ROI_Y (V4L2_CID_VEYE_MV_BASE + 6)
+#define V4L2_CID_VEYE_MV_BASE         (V4L2_CID_USER_BASE + 0x1000)
+#define V4L2_CID_VEYE_MV_TRIGGER_MODE (V4L2_CID_VEYE_MV_BASE + 1)
+#define V4L2_CID_VEYE_MV_ROI_X        (V4L2_CID_VEYE_MV_BASE + 5)
+#define V4L2_CID_VEYE_MV_ROI_Y        (V4L2_CID_VEYE_MV_BASE + 6)
 
 #define ROI_W_ALIGN 8u
 #define ROI_H_ALIGN 4u
@@ -174,17 +176,79 @@ static void extract_y10p_to_y8_strided(const uint8_t *src, uint32_t src_stride,
     }
 }
 
+/* RK3399 RKISP1_V10 writes 16-bit Big-Endian MSB-aligned RAW10/RAW12:
+ *   byte0 = D[bits-1 : bits-8] (high 8 bits)
+ *   byte1 = D[bits-9 : 0] << (16 - bits)
+ * Extract high 8 bits for preview8 / hardware JPEG Y plane. */
+static void extract_rkisp1_be_to_y8_strided(const uint8_t *src, uint32_t src_stride,
+                                            uint8_t *dst, uint32_t dst_stride,
+                                            uint32_t width, uint32_t height,
+                                            uint32_t x_offset_px) {
+    const uint32_t byte_off = x_offset_px * 2;
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *s = src + (size_t)y * src_stride + byte_off;
+        uint8_t *d = dst + (size_t)y * dst_stride;
+        uint32_t x = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        for (; x + 16 <= width; x += 16) {
+            uint8x16x2_t v = vld2q_u8(s + 2 * x);
+            vst1q_u8(d + x, v.val[0]);
+        }
+#endif
+        for (; x < width; ++x) {
+            d[x] = s[2 * x];
+        }
+    }
+}
+
+/* Convert RK3399 RKISP1_V10 16-bit Big-Endian MSB-aligned RAW10/RAW12 into
+ * standard V4L2 unpacked Little-Endian LSB-aligned uint16 (PIXFMT_Y10 / Y12). */
+static void unpack_rkisp1_be_to_le_u16(const uint8_t *src, uint32_t src_stride,
+                                       uint8_t *dst, uint32_t width, uint32_t height,
+                                       uint16_t bit_depth) {
+    const unsigned int shift = (bit_depth == 10) ? 6u : 4u;
+    const uint32_t dst_stride = width * 2;
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t *s = src + (size_t)y * src_stride;
+        uint16_t *d = (uint16_t *)(dst + (size_t)y * dst_stride);
+        uint32_t x = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        if (bit_depth == 10) {
+            for (; x + 8 <= width; x += 8) {
+                uint8x16_t raw = vld1q_u8(s + 2 * x);
+                uint16x8_t be  = vreinterpretq_u16_u8(vrev16q_u8(raw));
+                vst1q_u16(d + x, vshrq_n_u16(be, 6));
+            }
+        } else {
+            for (; x + 8 <= width; x += 8) {
+                uint8x16_t raw = vld1q_u8(s + 2 * x);
+                uint16x8_t be  = vreinterpretq_u16_u8(vrev16q_u8(raw));
+                vst1q_u16(d + x, vshrq_n_u16(be, 4));
+            }
+        }
+#endif
+        for (; x < width; ++x) {
+            uint16_t be = ((uint16_t)s[2 * x] << 8) | (uint16_t)s[2 * x + 1];
+            d[x] = (uint16_t)(be >> shift);
+        }
+    }
+}
+
 typedef struct {
     const uint8_t *src;
     uint32_t       src_stride;
     uint32_t       src_w;
     uint16_t       bit_depth;
-} H264FillCtx;
+    CamBackend     backend;
+} PreviewFillCtx;
 
-static void fill_y_for_h264(uint8_t *dst_y, uint32_t dst_stride,
-                            uint32_t ew, uint32_t eh, void *user_ctx) {
-    H264FillCtx *ctx = (H264FillCtx *)user_ctx;
-    if (ctx->bit_depth == 10) {
+static void fill_y_for_preview(uint8_t *dst_y, uint32_t dst_stride,
+                               uint32_t ew, uint32_t eh, void *user_ctx) {
+    PreviewFillCtx *ctx = (PreviewFillCtx *)user_ctx;
+    if (ctx->backend == CAM_BACKEND_RKISP1) {
+        uint32_t x_off = (ctx->src_w > ew) ? ((ctx->src_w - ew) / 2) : 0;
+        extract_rkisp1_be_to_y8_strided(ctx->src, ctx->src_stride, dst_y, dst_stride, ew, eh, x_off);
+    } else if (ctx->bit_depth == 10) {
         uint32_t x_off_quads = (ctx->src_w > ew) ? ((ctx->src_w - ew) / 2 / 4) : 0;
         extract_y10p_to_y8_strided(ctx->src, ctx->src_stride, dst_y, dst_stride, ew, eh, x_off_quads);
     } else {
@@ -194,6 +258,25 @@ static void fill_y_for_h264(uint8_t *dst_y, uint32_t dst_stride,
 }
 
 /* ---------------- Device discovery ---------------- */
+
+static bool discover_rkisp1_media(char *out_path, size_t out_sz) {
+    for (int i = 0; i < 16; ++i) {
+        char cand[64];
+        snprintf(cand, sizeof(cand), "/dev/media%d", i);
+        int fd = open(cand, O_RDWR);
+        if (fd < 0) continue;
+        struct media_device_info info;
+        memset(&info, 0, sizeof(info));
+        bool match = (xioctl(fd, MEDIA_IOC_DEVICE_INFO, &info) == 0 &&
+                      strcmp(info.driver, "rkisp1") == 0);
+        close(fd);
+        if (match) {
+            snprintf(out_path, out_sz, "%s", cand);
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool discover_devices(Camera *cam, char *err, size_t err_sz) {
     char i2c_dev[64] = { 0 };
@@ -226,8 +309,13 @@ static bool discover_devices(Camera *cam, char *err, size_t err_sz) {
         return false;
     }
 
-    char video_dev[64] = { 0 };
+    char unicam_dev[64] = { 0 };
+    char rkisp1_dev[64] = { 0 };
     char subdev_dev[64] = { 0 };
+    char csi_subdev[64] = { 0 };
+    char isp_subdev[64] = { 0 };
+    char rsz_mp_subdev[64] = { 0 };
+
     d = opendir("/sys/class/video4linux");
     if (d) {
         struct dirent *ent;
@@ -236,21 +324,45 @@ static bool discover_devices(Camera *cam, char *err, size_t err_sz) {
             char npath[320], vname[128];
             snprintf(npath, sizeof(npath), "/sys/class/video4linux/%.200s/name", ent->d_name);
             if (!read_trim_file(npath, vname, sizeof(vname))) continue;
-            if (!video_dev[0] && strcmp(vname, "unicam-image") == 0) {
-                snprintf(video_dev, sizeof(video_dev), "/dev/%.50s", ent->d_name);
+            if (!unicam_dev[0] && strcmp(vname, "unicam-image") == 0) {
+                snprintf(unicam_dev, sizeof(unicam_dev), "/dev/%.50s", ent->d_name);
+            } else if (!rkisp1_dev[0] && strcmp(vname, "rkisp1_mainpath") == 0) {
+                snprintf(rkisp1_dev, sizeof(rkisp1_dev), "/dev/%.50s", ent->d_name);
             } else if (!subdev_dev[0] && strncmp(vname, "mvcam ", 6) == 0) {
                 snprintf(subdev_dev, sizeof(subdev_dev), "/dev/%.50s", ent->d_name);
+            } else if (!csi_subdev[0] && strcmp(vname, "rkisp1_csi") == 0) {
+                snprintf(csi_subdev, sizeof(csi_subdev), "/dev/%.50s", ent->d_name);
+            } else if (!isp_subdev[0] && strcmp(vname, "rkisp1_isp") == 0) {
+                snprintf(isp_subdev, sizeof(isp_subdev), "/dev/%.50s", ent->d_name);
+            } else if (!rsz_mp_subdev[0] && strcmp(vname, "rkisp1_resizer_mainpath") == 0) {
+                snprintf(rsz_mp_subdev, sizeof(rsz_mp_subdev), "/dev/%.50s", ent->d_name);
             }
         }
         closedir(d);
     }
-    if (!video_dev[0] || !subdev_dev[0]) {
-        snprintf(err, err_sz, "V4L2 nodes (unicam-image / mvcam subdev) not found.");
+
+    if (unicam_dev[0] && subdev_dev[0]) {
+        cam->backend = CAM_BACKEND_UNICAM;
+        snprintf(cam->status.platform, sizeof(cam->status.platform), "rpi");
+        snprintf(cam->status.video_dev, sizeof(cam->status.video_dev), "%s", unicam_dev);
+    } else if (rkisp1_dev[0] && subdev_dev[0]) {
+        cam->backend = CAM_BACKEND_RKISP1;
+        snprintf(cam->status.platform, sizeof(cam->status.platform), "rk3399");
+        snprintf(cam->status.video_dev, sizeof(cam->status.video_dev), "%s", rkisp1_dev);
+        snprintf(cam->csi_subdev, sizeof(cam->csi_subdev), "%s", csi_subdev);
+        snprintf(cam->isp_subdev, sizeof(cam->isp_subdev), "%s", isp_subdev);
+        snprintf(cam->rsz_mp_subdev, sizeof(cam->rsz_mp_subdev), "%s", rsz_mp_subdev);
+        if (!cam->csi_subdev[0] || !cam->isp_subdev[0] || !cam->rsz_mp_subdev[0] ||
+            !discover_rkisp1_media(cam->media_dev, sizeof(cam->media_dev))) {
+            snprintf(err, err_sz, "RKISP1 media/subdev nodes incomplete (csi/isp/resizer/media).");
+            return false;
+        }
+    } else {
+        snprintf(err, err_sz, "V4L2 nodes (unicam-image or rkisp1_mainpath / mvcam subdev) not found.");
         return false;
     }
 
     snprintf(cam->status.camera_model, sizeof(cam->status.camera_model), "%s", model);
-    snprintf(cam->status.video_dev, sizeof(cam->status.video_dev), "%s", video_dev);
     snprintf(cam->status.subdev_dev, sizeof(cam->status.subdev_dev), "%s", subdev_dev);
     snprintf(cam->status.i2c_dev, sizeof(cam->status.i2c_dev), "%s", i2c_dev);
     return true;
@@ -258,9 +370,47 @@ static bool discover_devices(Camera *cam, char *err, size_t err_sz) {
 
 /* ---------------- V4L2 & I2C internal helpers (caller holds ctrl_mu) ---------------- */
 
+static enum v4l2_buf_type cam_buf_type(const Camera *cam) {
+    return (cam->backend == CAM_BACKEND_RKISP1)
+           ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+           : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+}
+
+static bool cam_qbuf(const Camera *cam, uint32_t index) {
+    struct v4l2_buffer buf;
+    struct v4l2_plane pl;
+    memset(&buf, 0, sizeof(buf));
+    memset(&pl, 0, sizeof(pl));
+    buf.type = cam_buf_type(cam);
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = index;
+    if (cam->backend == CAM_BACKEND_RKISP1) {
+        buf.length = 1;
+        buf.m.planes = &pl;
+    }
+    return xioctl(cam->video_fd, VIDIOC_QBUF, &buf) == 0;
+}
+
+static bool cam_dqbuf(const Camera *cam, uint32_t *out_index, uint32_t *out_bytesused) {
+    struct v4l2_buffer buf;
+    struct v4l2_plane pl;
+    memset(&buf, 0, sizeof(buf));
+    memset(&pl, 0, sizeof(pl));
+    buf.type = cam_buf_type(cam);
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (cam->backend == CAM_BACKEND_RKISP1) {
+        buf.length = 1;
+        buf.m.planes = &pl;
+    }
+    if (xioctl(cam->video_fd, VIDIOC_DQBUF, &buf) < 0) return false;
+    *out_index = buf.index;
+    *out_bytesused = (cam->backend == CAM_BACKEND_RKISP1) ? pl.bytesused : buf.bytesused;
+    return true;
+}
+
 static void stop_v4l2_locked(Camera *cam) {
+    enum v4l2_buf_type type = cam_buf_type(cam);
     if (cam->video_fd >= 0 && cam->status.streaming) {
-        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         xioctl(cam->video_fd, VIDIOC_STREAMOFF, &type);
         cam->status.streaming = false;
     }
@@ -274,17 +424,18 @@ static void stop_v4l2_locked(Camera *cam) {
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
         req.count = 0;
-        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.type = type;
         req.memory = V4L2_MEMORY_MMAP;
         xioctl(cam->video_fd, VIDIOC_REQBUFS, &req);
     }
 }
 
 static bool start_v4l2_locked(Camera *cam, char *err, size_t err_sz) {
+    enum v4l2_buf_type type = cam_buf_type(cam);
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
     req.count = CAM_MAX_MMAP_BUFS;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.type = type;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(cam->video_fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2) {
         snprintf(err, err_sz, "VIDIOC_REQBUFS failed: %s", strerror(errno));
@@ -295,41 +446,43 @@ static bool start_v4l2_locked(Camera *cam, char *err, size_t err_sz) {
     cam->buf_count = 0;
     for (uint32_t i = 0; i < req.count; ++i) {
         struct v4l2_buffer buf;
+        struct v4l2_plane pl;
         memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        memset(&pl, 0, sizeof(pl));
+        buf.type = type;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
+        if (cam->backend == CAM_BACKEND_RKISP1) {
+            buf.length = 1;
+            buf.m.planes = &pl;
+        }
         if (xioctl(cam->video_fd, VIDIOC_QUERYBUF, &buf) < 0) {
             snprintf(err, err_sz, "VIDIOC_QUERYBUF failed: %s", strerror(errno));
             stop_v4l2_locked(cam);
             return false;
         }
-        void *ptr = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
-                         cam->video_fd, buf.m.offset);
+        size_t map_len = (cam->backend == CAM_BACKEND_RKISP1) ? pl.length : buf.length;
+        off_t map_off  = (cam->backend == CAM_BACKEND_RKISP1) ? pl.m.mem_offset : buf.m.offset;
+        void *ptr = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         cam->video_fd, map_off);
         if (ptr == MAP_FAILED) {
             snprintf(err, err_sz, "mmap failed: %s", strerror(errno));
             stop_v4l2_locked(cam);
             return false;
         }
         cam->buffers[i].start = ptr;
-        cam->buffers[i].length = buf.length;
+        cam->buffers[i].length = map_len;
         cam->buf_count = i + 1;
     }
 
     for (uint32_t i = 0; i < cam->buf_count; ++i) {
-        struct v4l2_buffer buf;
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = i;
-        if (xioctl(cam->video_fd, VIDIOC_QBUF, &buf) < 0) {
+        if (!cam_qbuf(cam, i)) {
             snprintf(err, err_sz, "VIDIOC_QBUF failed: %s", strerror(errno));
             stop_v4l2_locked(cam);
             return false;
         }
     }
 
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(cam->video_fd, VIDIOC_STREAMON, &type) < 0) {
         snprintf(err, err_sz, "VIDIOC_STREAMON failed: %s", strerror(errno));
         stop_v4l2_locked(cam);
@@ -337,6 +490,85 @@ static bool start_v4l2_locked(Camera *cam, char *err, size_t err_sz) {
     }
     cam->status.streaming = true;
     return true;
+}
+
+static bool subdev_set_fmt_crop(const char *path, uint32_t pad, uint32_t code,
+                                uint32_t w, uint32_t h, bool set_crop,
+                                char *err, size_t err_sz) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        snprintf(err, err_sz, "Failed to open subdev %s: %s", path, strerror(errno));
+        return false;
+    }
+    struct v4l2_subdev_format sfmt;
+    memset(&sfmt, 0, sizeof(sfmt));
+    sfmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    sfmt.pad = pad;
+    sfmt.format.width = w;
+    sfmt.format.height = h;
+    sfmt.format.code = code;
+    sfmt.format.field = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0) {
+        snprintf(err, err_sz, "SUBDEV_S_FMT failed on %s:%u: %s", path, pad, strerror(errno));
+        close(fd);
+        return false;
+    }
+    if (set_crop) {
+        struct v4l2_subdev_selection sel;
+        memset(&sel, 0, sizeof(sel));
+        sel.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+        sel.pad = pad;
+        sel.target = V4L2_SEL_TGT_CROP;
+        sel.r.left = 0;
+        sel.r.top = 0;
+        sel.r.width = w;
+        sel.r.height = h;
+        if (xioctl(fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0) {
+            snprintf(err, err_sz, "SUBDEV_S_SELECTION crop failed on %s:%u: %s",
+                     path, pad, strerror(errno));
+            close(fd);
+            return false;
+        }
+    }
+    close(fd);
+    return true;
+}
+
+static void rkisp1_disable_selfpath_link(const char *media_dev) {
+    int mfd = open(media_dev, O_RDWR);
+    if (mfd < 0) return;
+
+    uint32_t isp_id = 0, sp_id = 0;
+    struct media_entity_desc edesc;
+    memset(&edesc, 0, sizeof(edesc));
+    edesc.id = MEDIA_ENT_ID_FLAG_NEXT;
+    while (xioctl(mfd, MEDIA_IOC_ENUM_ENTITIES, &edesc) == 0) {
+        if (strcmp(edesc.name, "rkisp1_isp") == 0) isp_id = edesc.id;
+        else if (strcmp(edesc.name, "rkisp1_resizer_selfpath") == 0) sp_id = edesc.id;
+        edesc.id |= MEDIA_ENT_ID_FLAG_NEXT;
+    }
+
+    if (isp_id && sp_id) {
+        struct media_pad_desc pads[8];
+        struct media_link_desc links[16];
+        struct media_links_enum lenum;
+        memset(&lenum, 0, sizeof(lenum));
+        lenum.entity = isp_id;
+        lenum.pads = pads;
+        lenum.links = links;
+        if (xioctl(mfd, MEDIA_IOC_ENUM_LINKS, &lenum) == 0) {
+            for (int i = 0; i < 16; ++i) {
+                if (links[i].source.entity == isp_id &&
+                    links[i].sink.entity == sp_id &&
+                    (links[i].flags & MEDIA_LNK_FL_ENABLED)) {
+                    links[i].flags &= ~MEDIA_LNK_FL_ENABLED;
+                    xioctl(mfd, MEDIA_IOC_SETUP_LINK, &links[i]);
+                    break;
+                }
+            }
+        }
+    }
+    close(mfd);
 }
 
 static bool configure_pipeline_locked(Camera *cam, uint16_t bit_depth, uint32_t roi_x, uint32_t roi_y,
@@ -361,6 +593,10 @@ static bool configure_pipeline_locked(Camera *cam, uint16_t bit_depth, uint32_t 
 
     struct v4l2_control ctrl;
     memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = V4L2_CID_VEYE_MV_TRIGGER_MODE;
+    ctrl.value = 0;
+    xioctl(cam->subdev_fd, VIDIOC_S_CTRL, &ctrl);
+
     ctrl.id = V4L2_CID_VEYE_MV_ROI_X;
     ctrl.value = (int32_t)roi_x;
     if (xioctl(cam->subdev_fd, VIDIOC_S_CTRL, &ctrl) < 0) {
@@ -374,47 +610,89 @@ static bool configure_pipeline_locked(Camera *cam, uint16_t bit_depth, uint32_t 
         return false;
     }
 
+    uint32_t mbus_code = (bit_depth == 10) ? MEDIA_BUS_FMT_Y10_1X10 : MEDIA_BUS_FMT_Y12_1X12;
     struct v4l2_subdev_format sfmt;
     memset(&sfmt, 0, sizeof(sfmt));
     sfmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
     sfmt.pad = 0;
     sfmt.format.width = width;
     sfmt.format.height = height;
-    sfmt.format.code = (bit_depth == 10) ? MEDIA_BUS_FMT_Y10_1X10 : MEDIA_BUS_FMT_Y12_1X12;
+    sfmt.format.code = mbus_code;
     sfmt.format.field = V4L2_FIELD_NONE;
     if (xioctl(cam->subdev_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0) {
         snprintf(err, err_sz, "VIDIOC_SUBDEV_S_FMT failed: %s", strerror(errno));
         return false;
     }
     xioctl(cam->subdev_fd, VIDIOC_SUBDEV_G_FMT, &sfmt);
+    uint32_t eff_w = sfmt.format.width ? sfmt.format.width : width;
+    uint32_t eff_h = sfmt.format.height ? sfmt.format.height : height;
 
-    struct v4l2_format vfmt;
-    memset(&vfmt, 0, sizeof(vfmt));
-    vfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    vfmt.fmt.pix.width = sfmt.format.width ? sfmt.format.width : width;
-    vfmt.fmt.pix.height = sfmt.format.height ? sfmt.format.height : height;
-    vfmt.fmt.pix.pixelformat = (bit_depth == 10) ? V4L2_PIX_FMT_Y10P : V4L2_PIX_FMT_Y12P;
-    vfmt.fmt.pix.field = V4L2_FIELD_NONE;
-    if (xioctl(cam->video_fd, VIDIOC_S_FMT, &vfmt) < 0) {
-        snprintf(err, err_sz, "VIDIOC_S_FMT failed: %s", strerror(errno));
-        return false;
+    if (cam->backend == CAM_BACKEND_RKISP1) {
+        rkisp1_disable_selfpath_link(cam->media_dev);
+        if (!subdev_set_fmt_crop(cam->csi_subdev, 0, mbus_code, eff_w, eff_h, false, err, err_sz) ||
+            !subdev_set_fmt_crop(cam->isp_subdev, 0, mbus_code, eff_w, eff_h, true, err, err_sz) ||
+            !subdev_set_fmt_crop(cam->isp_subdev, 2, mbus_code, eff_w, eff_h, true, err, err_sz) ||
+            !subdev_set_fmt_crop(cam->rsz_mp_subdev, 0, mbus_code, eff_w, eff_h, true, err, err_sz) ||
+            !subdev_set_fmt_crop(cam->rsz_mp_subdev, 1, mbus_code, eff_w, eff_h, false, err, err_sz)) {
+            return false;
+        }
+
+        struct v4l2_format vfmt;
+        memset(&vfmt, 0, sizeof(vfmt));
+        vfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        vfmt.fmt.pix_mp.width = eff_w;
+        vfmt.fmt.pix_mp.height = eff_h;
+        vfmt.fmt.pix_mp.pixelformat = (bit_depth == 10) ? V4L2_PIX_FMT_Y10 : V4L2_PIX_FMT_Y12;
+        vfmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+        vfmt.fmt.pix_mp.num_planes = 1;
+        if (xioctl(cam->video_fd, VIDIOC_S_FMT, &vfmt) < 0) {
+            snprintf(err, err_sz, "VIDIOC_S_FMT (mplane) failed: %s", strerror(errno));
+            return false;
+        }
+        cam->status.width = vfmt.fmt.pix_mp.width;
+        cam->status.height = vfmt.fmt.pix_mp.height;
+        cam->status.stride = vfmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+    } else {
+        struct v4l2_format vfmt;
+        memset(&vfmt, 0, sizeof(vfmt));
+        vfmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        vfmt.fmt.pix.width = eff_w;
+        vfmt.fmt.pix.height = eff_h;
+        vfmt.fmt.pix.pixelformat = (bit_depth == 10) ? V4L2_PIX_FMT_Y10P : V4L2_PIX_FMT_Y12P;
+        vfmt.fmt.pix.field = V4L2_FIELD_NONE;
+        if (xioctl(cam->video_fd, VIDIOC_S_FMT, &vfmt) < 0) {
+            snprintf(err, err_sz, "VIDIOC_S_FMT failed: %s", strerror(errno));
+            return false;
+        }
+        cam->status.width = vfmt.fmt.pix.width;
+        cam->status.height = vfmt.fmt.pix.height;
+        cam->status.stride = vfmt.fmt.pix.bytesperline;
     }
 
     cam->status.bit_depth = bit_depth;
     cam->status.roi_x = roi_x;
     cam->status.roi_y = roi_y;
-    cam->status.width = vfmt.fmt.pix.width;
-    cam->status.height = vfmt.fmt.pix.height;
-    cam->status.stride = vfmt.fmt.pix.bytesperline;
 
-    /* Reopen hardware H.264 encoder for new dimensions */
+    /* Reopen hardware preview encoder for new dimensions */
     h264_enc_close(&cam->h264_enc);
-    if (!h264_enc_open(&cam->h264_enc, cam->status.width, cam->status.height, 8000000, 30, "/dev/video11")) {
-        if (atomic_load(&cam->stream_mode_id) == 2) {
-            snprintf(cam->status.stream_mode, sizeof(cam->status.stream_mode), "lossless");
-            atomic_store(&cam->stream_mode_id, 0);
+    mjpeg_enc_close(&cam->mjpeg_enc);
+    if (cam->backend == CAM_BACKEND_RKISP1) {
+        if (!mjpeg_enc_open(&cam->mjpeg_enc, cam->status.width, cam->status.height, 85, NULL)) {
+            if (atomic_load(&cam->stream_mode_id) == 3) {
+                snprintf(cam->status.stream_mode, sizeof(cam->status.stream_mode), "lossless");
+                atomic_store(&cam->stream_mode_id, 0);
+            }
+        }
+    } else {
+        if (!h264_enc_open(&cam->h264_enc, cam->status.width, cam->status.height, 8000000, 30, "/dev/video11")) {
+            if (atomic_load(&cam->stream_mode_id) == 2) {
+                snprintf(cam->status.stream_mode, sizeof(cam->status.stream_mode), "lossless");
+                atomic_store(&cam->stream_mode_id, 0);
+            }
         }
     }
+    cam->status.h264_supported = cam->h264_enc.streaming;
+    cam->status.mjpeg_supported = cam->mjpeg_enc.streaming;
     atomic_store(&cam->keyframe_req, true);
     return true;
 }
@@ -531,24 +809,22 @@ static void *capture_loop(void *arg) {
     uint64_t telem_t0 = fps_t0;
 
     ByteBuf work_buf;
+    ByteBuf raw_conv_buf;
     bytebuf_init(&work_buf);
+    bytebuf_init(&raw_conv_buf);
 
     while (atomic_load(&cam->running)) {
         struct pollfd pfd = { cam->video_fd, POLLIN, 0 };
         int pr = poll(&pfd, 1, 200);
         if (pr <= 0) continue;
 
-        struct v4l2_buffer buf;
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(cam->video_fd, VIDIOC_DQBUF, &buf) < 0) {
+        uint32_t buf_idx = 0, bytesused = 0;
+        if (!cam_dqbuf(cam, &buf_idx, &bytesused)) {
             if (errno == EAGAIN) continue;
             break;
         }
 
-        const uint8_t *src = (const uint8_t *)cam->buffers[buf.index].start;
-        const uint32_t bytesused = buf.bytesused;
+        const uint8_t *src = (const uint8_t *)cam->buffers[buf_idx].start;
         const uint64_t ts_ns = monotonic_ns();
 
         pthread_mutex_lock(&cam->ctrl_mu);
@@ -561,8 +837,9 @@ static void *capture_loop(void *arg) {
         pthread_mutex_unlock(&cam->ctrl_mu);
 
         const uint64_t seq = atomic_fetch_add(&cam->frame_seq_counter, 1) + 1;
+        const bool is_rkisp1 = (cam->backend == CAM_BACKEND_RKISP1);
         const uint32_t max_raw = stride * h;
-        const uint32_t raw_payload_size = bytesused < max_raw ? bytesused : max_raw;
+        const uint32_t raw_payload_size = is_rkisp1 ? (w * h * 2) : (bytesused < max_raw ? bytesused : max_raw);
 
         FrameHeader raw_hdr;
         memset(&raw_hdr, 0, sizeof(raw_hdr));
@@ -571,11 +848,16 @@ static void *capture_loop(void *arg) {
         raw_hdr.magic[2] = RAWCAM_FRAME_MAGIC_2;
         raw_hdr.magic[3] = RAWCAM_FRAME_MAGIC_3;
         raw_hdr.version = RAWCAM_PROTOCOL_VERSION;
-        raw_hdr.pixel_format = (uint16_t)(bd == 10 ? PIXFMT_Y10P : PIXFMT_Y12P);
+        if (is_rkisp1) {
+            raw_hdr.pixel_format = (uint16_t)(bd == 10 ? PIXFMT_Y10 : PIXFMT_Y12);
+            raw_hdr.stride = w * 2;
+        } else {
+            raw_hdr.pixel_format = (uint16_t)(bd == 10 ? PIXFMT_Y10P : PIXFMT_Y12P);
+            raw_hdr.stride = stride;
+        }
         raw_hdr.flags = FLAG_LOSSLESS;
         raw_hdr.width = w;
         raw_hdr.height = h;
-        raw_hdr.stride = stride;
         raw_hdr.payload_size = raw_payload_size;
         raw_hdr.exposure_us = (uint32_t)atomic_load(&cam->cached_exp_us);
         raw_hdr.frame_seq = seq;
@@ -586,23 +868,33 @@ static void *capture_loop(void *arg) {
         raw_hdr.roi_x = (uint16_t)rx;
         raw_hdr.roi_y = (uint16_t)ry;
 
+        int mode_id = atomic_load(&cam->stream_mode_id);
+        bool want_snap = atomic_load_explicit(&cam->snap_req, memory_order_relaxed);
+        const uint8_t *lossless_ptr = src;
+        if (is_rkisp1 && (want_snap || mode_id == 0)) {
+            if (bytebuf_reserve(&raw_conv_buf, raw_payload_size)) {
+                raw_conv_buf.size = raw_payload_size;
+                unpack_rkisp1_be_to_le_u16(src, stride, raw_conv_buf.data, w, h, bd);
+                lossless_ptr = raw_conv_buf.data;
+            }
+        }
+
         /* On-demand 10/12-bit lossless copy for snapshot requests (port 5602) */
-        if (atomic_load_explicit(&cam->snap_req, memory_order_relaxed)) {
+        if (want_snap) {
             pthread_mutex_lock(&cam->raw_mu);
             cam->latest_raw_frame.header = raw_hdr;
-            bytebuf_assign(&cam->latest_raw_frame.data, src, raw_payload_size);
+            bytebuf_assign(&cam->latest_raw_frame.data, lossless_ptr, raw_payload_size);
             cam->snap_done_seq = seq;
             atomic_store(&cam->snap_req, false);
             pthread_cond_broadcast(&cam->raw_cv);
             pthread_mutex_unlock(&cam->raw_mu);
         }
 
-        int mode_id = atomic_load(&cam->stream_mode_id);
         if (mode_id == 0) {
-            /* Lossless MIPI packed directly from Unicam DMA */
+            /* Lossless RAW (MIPI packed on Unicam, standard uint16 LE on RKISP1) */
             pthread_mutex_lock(&cam->frame_mu);
             cam->latest_frame.header = raw_hdr;
-            bytebuf_assign(&cam->latest_frame.data, src, raw_payload_size);
+            bytebuf_assign(&cam->latest_frame.data, lossless_ptr, raw_payload_size);
             cam->latest_seq = seq;
             pthread_cond_broadcast(&cam->frame_cv);
             pthread_mutex_unlock(&cam->frame_mu);
@@ -615,7 +907,9 @@ static void *capture_loop(void *arg) {
             hdr.payload_size = w * h;
             if (bytebuf_reserve(&work_buf, hdr.payload_size)) {
                 work_buf.size = hdr.payload_size;
-                if (bd == 10) {
+                if (is_rkisp1) {
+                    extract_rkisp1_be_to_y8_strided(src, stride, work_buf.data, w, w, h, 0);
+                } else if (bd == 10) {
                     extract_y10p_to_y8_strided(src, stride, work_buf.data, w, w, h, 0);
                 } else {
                     extract_y12p_to_y8_strided(src, stride, work_buf.data, w, w, h, 0);
@@ -628,14 +922,14 @@ static void *capture_loop(void *arg) {
                 pthread_mutex_unlock(&cam->frame_mu);
             }
         } else if (mode_id == 2 && cam->h264_enc.streaming) {
-            /* Hardware H.264 encode via /dev/video11 */
+            /* Hardware H.264 encode via /dev/video11 (RPi) */
             if (atomic_exchange(&cam->keyframe_req, false)) {
                 h264_enc_force_keyframe(&cam->h264_enc);
             }
-            H264FillCtx fctx = { src, stride, w, bd };
+            PreviewFillCtx fctx = { src, stride, w, bd, cam->backend };
             bool is_kf = false;
             size_t nal_len = 0;
-            if (h264_enc_encode(&cam->h264_enc, fill_y_for_h264, &fctx,
+            if (h264_enc_encode(&cam->h264_enc, fill_y_for_preview, &fctx,
                                 &work_buf.data, &work_buf.cap, &nal_len, &is_kf)) {
                 work_buf.size = nal_len;
                 FrameHeader hdr = raw_hdr;
@@ -653,9 +947,31 @@ static void *capture_loop(void *arg) {
                 pthread_cond_broadcast(&cam->frame_cv);
                 pthread_mutex_unlock(&cam->frame_mu);
             }
+        } else if (mode_id == 3 && cam->mjpeg_enc.streaming) {
+            /* Hardware JPEG/MJPEG encode via Hantro VPU (RK3399) */
+            PreviewFillCtx fctx = { src, stride, w, bd, cam->backend };
+            size_t jpg_len = 0;
+            if (mjpeg_enc_encode(&cam->mjpeg_enc, fill_y_for_preview, &fctx,
+                                 &work_buf.data, &work_buf.cap, &jpg_len)) {
+                work_buf.size = jpg_len;
+                FrameHeader hdr = raw_hdr;
+                hdr.pixel_format = (uint16_t)PIXFMT_MJPEG;
+                hdr.flags = FLAG_PREVIEW | FLAG_KEYFRAME;
+                hdr.width = cam->mjpeg_enc.src_w;
+                hdr.height = cam->mjpeg_enc.src_h;
+                hdr.stride = hdr.width;
+                hdr.payload_size = (uint32_t)jpg_len;
+
+                pthread_mutex_lock(&cam->frame_mu);
+                cam->latest_frame.header = hdr;
+                bytebuf_assign(&cam->latest_frame.data, work_buf.data, jpg_len);
+                cam->latest_seq = seq;
+                pthread_cond_broadcast(&cam->frame_cv);
+                pthread_mutex_unlock(&cam->frame_mu);
+            }
         }
 
-        xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
+        cam_qbuf(cam, buf_idx);
 
         ++fps_frames;
         uint64_t now = monotonic_ns();
@@ -678,6 +994,7 @@ static void *capture_loop(void *arg) {
         }
     }
 
+    bytebuf_free(&raw_conv_buf);
     bytebuf_free(&work_buf);
     return NULL;
 }
@@ -690,6 +1007,7 @@ bool camera_init(Camera *cam, char *err, size_t err_sz) {
     cam->subdev_fd = -1;
     i2c_ctrl_init(&cam->i2c);
     h264_enc_init(&cam->h264_enc);
+    mjpeg_enc_init(&cam->mjpeg_enc);
     framebuf_init(&cam->latest_frame);
     framebuf_init(&cam->latest_raw_frame);
 
@@ -732,12 +1050,17 @@ bool camera_init(Camera *cam, char *err, size_t err_sz) {
         return false;
     }
 
+    snprintf(cam->status.sensor_type, sizeof(cam->status.sensor_type), "mono");
     cam->status.sensor_width = 1944;
     cam->status.sensor_height = 1096;
     cam->status.min_roi_width = 368;
     cam->status.min_roi_height = 304;
+    cam->status.format_cap_mask = 0x6; /* default: RAW10 + RAW12 */
 
     uint32_t v = 0;
+    if (i2c_ctrl_read_u32(&cam->i2c, REG_FORMAT_CAP, &v) && (v & 0x6u)) {
+        cam->status.format_cap_mask = v;
+    }
     if (i2c_ctrl_read_u32(&cam->i2c, REG_SENSOR_WIDTH, &v) && v > 0) cam->status.sensor_width = v;
     if (i2c_ctrl_read_u32(&cam->i2c, REG_SENSOR_HEIGHT, &v) && v > 0) cam->status.sensor_height = v;
     if (i2c_ctrl_read_u32(&cam->i2c, REG_MIN_ROI_WIDTH, &v) && v >= 64 && v <= cam->status.sensor_width) {
@@ -747,7 +1070,7 @@ bool camera_init(Camera *cam, char *err, size_t err_sz) {
         cam->status.min_roi_height = v;
     }
 
-    cam->status.bit_depth = 12;
+    cam->status.bit_depth = (cam->status.format_cap_mask & 0x4u) ? 12 : 10;
     cam->status.roi_x = 0;
     cam->status.roi_y = 0;
     cam->status.width = cam->status.sensor_width;
@@ -757,7 +1080,13 @@ bool camera_init(Camera *cam, char *err, size_t err_sz) {
     snprintf(cam->status.gain_mode, sizeof(cam->status.gain_mode), "manual");
     cam->status.target_gain_db = 0.0;
     cam->status.target_fps = 30.0;
-    snprintf(cam->status.stream_mode, sizeof(cam->status.stream_mode), "h264");
+    if (cam->backend == CAM_BACKEND_RKISP1) {
+        snprintf(cam->status.stream_mode, sizeof(cam->status.stream_mode), "mjpeg");
+        atomic_store(&cam->stream_mode_id, 3);
+    } else {
+        snprintf(cam->status.stream_mode, sizeof(cam->status.stream_mode), "h264");
+        atomic_store(&cam->stream_mode_id, 2);
+    }
 
     if (!configure_pipeline_locked(cam, cam->status.bit_depth, 0, 0,
                                    cam->status.width, cam->status.height, err, err_sz)) {
@@ -778,6 +1107,7 @@ void camera_shutdown(Camera *cam) {
     camera_stop_capture(cam);
     pthread_mutex_lock(&cam->ctrl_mu);
     h264_enc_close(&cam->h264_enc);
+    mjpeg_enc_close(&cam->mjpeg_enc);
     stop_v4l2_locked(cam);
     i2c_ctrl_close(&cam->i2c);
     if (cam->subdev_fd >= 0) {
@@ -899,8 +1229,9 @@ bool camera_set_stream_mode(Camera *cam, const char *mode, char *err, size_t err
     if (strcmp(mode, "lossless") == 0) id = 0;
     else if (strcmp(mode, "preview8") == 0) id = 1;
     else if (strcmp(mode, "h264") == 0) id = 2;
+    else if (strcmp(mode, "mjpeg") == 0) id = 3;
     else {
-        snprintf(err, err_sz, "stream_mode must be 'h264', 'lossless', or 'preview8'");
+        snprintf(err, err_sz, "stream_mode must be 'h264', 'mjpeg', 'lossless', or 'preview8'");
         return false;
     }
 
@@ -908,7 +1239,13 @@ bool camera_set_stream_mode(Camera *cam, const char *mode, char *err, size_t err
     if (id == 2 && !cam->h264_enc.streaming) {
         if (!h264_enc_open(&cam->h264_enc, cam->status.width, cam->status.height, 8000000, 30, "/dev/video11")) {
             pthread_mutex_unlock(&cam->ctrl_mu);
-            snprintf(err, err_sz, "Hardware H.264 encoder (/dev/video11) unavailable");
+            snprintf(err, err_sz, "Hardware H.264 encoder unavailable on this platform (use 'mjpeg')");
+            return false;
+        }
+    } else if (id == 3 && !cam->mjpeg_enc.streaming) {
+        if (!mjpeg_enc_open(&cam->mjpeg_enc, cam->status.width, cam->status.height, 85, NULL)) {
+            pthread_mutex_unlock(&cam->ctrl_mu);
+            snprintf(err, err_sz, "Hardware MJPEG encoder unavailable on this platform");
             return false;
         }
     }
@@ -1025,31 +1362,29 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
             snprintf(err, err_sz, "Timed out waiting for long-exposure frame");
             break;
         }
-        struct v4l2_buffer buf;
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(cam->video_fd, VIDIOC_DQBUF, &buf) < 0) {
+        uint32_t buf_idx = 0, bytesused = 0;
+        if (!cam_dqbuf(cam, &buf_idx, &bytesused)) {
             snprintf(err, err_sz, "VIDIOC_DQBUF failed: %s", strerror(errno));
             break;
         }
         double elapsed_ms = (double)(monotonic_ns() - t_start) / 1e6;
         if (attempt == 0 && exposure_us >= 500000 && elapsed_ms < (exposure_us / 1000.0) * 0.4) {
-            xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
+            cam_qbuf(cam, buf_idx);
             t_start = monotonic_ns();
             continue;
         }
 
-        const uint8_t *src = (const uint8_t *)cam->buffers[buf.index].start;
+        const uint8_t *src = (const uint8_t *)cam->buffers[buf_idx].start;
+        const bool is_rkisp1 = (cam->backend == CAM_BACKEND_RKISP1);
         uint32_t max_raw = stride * h;
-        uint32_t payload_size = buf.bytesused < max_raw ? buf.bytesused : max_raw;
+        uint32_t payload_size = is_rkisp1 ? (w * h * 2) : (bytesused < max_raw ? bytesused : max_raw);
         uint64_t seq = atomic_fetch_add(&cam->frame_seq_counter, 1) + 1;
 
         uint32_t hw_exp = 0, hw_gain = 0, hw_fps = 0;
         if (!i2c_ctrl_read_u32(&cam->i2c, REG_EXP_TIME, &hw_exp) ||
             !i2c_ctrl_read_u32(&cam->i2c, REG_CUR_GAIN, &hw_gain) ||
             !i2c_ctrl_read_u32(&cam->i2c, REG_FRAMERATE, &hw_fps)) {
-            xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
+            cam_qbuf(cam, buf_idx);
             snprintf(err, err_sz, "I2C readback failed for long-shot exposure/gain metadata");
             break;
         }
@@ -1061,11 +1396,16 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
         hdr.magic[2] = RAWCAM_FRAME_MAGIC_2;
         hdr.magic[3] = RAWCAM_FRAME_MAGIC_3;
         hdr.version = RAWCAM_PROTOCOL_VERSION;
-        hdr.pixel_format = (uint16_t)(bd == 10 ? PIXFMT_Y10P : PIXFMT_Y12P);
+        if (is_rkisp1) {
+            hdr.pixel_format = (uint16_t)(bd == 10 ? PIXFMT_Y10 : PIXFMT_Y12);
+            hdr.stride = w * 2;
+        } else {
+            hdr.pixel_format = (uint16_t)(bd == 10 ? PIXFMT_Y10P : PIXFMT_Y12P);
+            hdr.stride = stride;
+        }
         hdr.flags = FLAG_LOSSLESS;
         hdr.width = w;
         hdr.height = h;
-        hdr.stride = stride;
         hdr.payload_size = payload_size;
         hdr.exposure_us = hw_exp;
         hdr.frame_seq = seq;
@@ -1077,8 +1417,16 @@ bool camera_capture_long_shot(Camera *cam, uint32_t exposure_us, double gain_db,
         hdr.roi_y = (uint16_t)ry;
 
         out->header = hdr;
-        got = bytebuf_assign(&out->data, src, payload_size);
-        xioctl(cam->video_fd, VIDIOC_QBUF, &buf);
+        if (is_rkisp1) {
+            got = bytebuf_reserve(&out->data, payload_size);
+            if (got) {
+                out->data.size = payload_size;
+                unpack_rkisp1_be_to_le_u16(src, stride, out->data.data, w, h, bd);
+            }
+        } else {
+            got = bytebuf_assign(&out->data, src, payload_size);
+        }
+        cam_qbuf(cam, buf_idx);
         if (!got) {
             snprintf(err, err_sz, "Out of memory copying long-shot frame");
             break;

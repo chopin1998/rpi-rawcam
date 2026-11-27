@@ -1,0 +1,53 @@
+/dts-v1/;
+/plugin/;
+
+&i2c4 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@3b {
+		compatible = "veye,mvcam";
+		reg = <0x3b>;
+		reset-gpios = <&gpio1 13 0>;
+		VANA-supply = <&vcc_cam>;
+		VDIG-supply = <&vcc_cam>;
+		VDDL-supply = <&vcc_cam>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cif_clkouta>;
+		clocks = <&cru 137>;
+		clock-names = "xvclk";
+		assigned-clocks = <&cru 137>;
+		assigned-clock-rates = <24000000>;
+
+		port {
+			veye_out: endpoint {
+				remote-endpoint = <&isp0_in>;
+				clock-lanes = <0>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};
+
+&mipi_dphy_rx0 { status = "okay"; };
+&isp0_mmu { status = "okay"; };
+&isp0 {
+	status = "okay";
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			isp0_in: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&veye_out>;
+				bus-type = <4>;
+				clock-lanes = <0>;
+				data-lanes = <1 2>;
+			};
+		};
+	};
+};

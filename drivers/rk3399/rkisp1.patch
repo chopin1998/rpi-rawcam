@@ -1,0 +1,134 @@
+--- a/Makefile
++++ b/Makefile
+@@ -11,4 +11,4 @@
+ 
+ rockchip-isp1-$(CONFIG_DEBUG_FS) += rkisp1-debug.o
+ 
+-obj-$(CONFIG_VIDEO_ROCKCHIP_ISP1) += rockchip-isp1.o
++obj-m += rockchip-isp1.o
+--- a/rkisp1-common.c
++++ b/rkisp1-common.c
+@@ -30,6 +30,13 @@
+ 		.bus_width	= 10,
+ 		.direction	= RKISP1_ISP_SD_SINK | RKISP1_ISP_SD_SRC,
+ 	}, {
++		.mbus_code	= MEDIA_BUS_FMT_Y10_1X10,
++		.pixel_enc	= V4L2_PIXEL_ENC_BAYER,
++		.mipi_dt	= MIPI_CSI2_DT_RAW10,
++		.bayer_pat	= RKISP1_RAW_BGGR,
++		.bus_width	= 10,
++		.direction	= RKISP1_ISP_SD_SINK | RKISP1_ISP_SD_SRC,
++	}, {
+ 		.mbus_code	= MEDIA_BUS_FMT_SGBRG10_1X10,
+ 		.pixel_enc	= V4L2_PIXEL_ENC_BAYER,
+ 		.mipi_dt	= MIPI_CSI2_DT_RAW10,
+@@ -52,6 +59,13 @@
+ 		.direction	= RKISP1_ISP_SD_SINK | RKISP1_ISP_SD_SRC,
+ 	}, {
+ 		.mbus_code	= MEDIA_BUS_FMT_SBGGR12_1X12,
++		.pixel_enc	= V4L2_PIXEL_ENC_BAYER,
++		.mipi_dt	= MIPI_CSI2_DT_RAW12,
++		.bayer_pat	= RKISP1_RAW_BGGR,
++		.bus_width	= 12,
++		.direction	= RKISP1_ISP_SD_SINK | RKISP1_ISP_SD_SRC,
++	}, {
++		.mbus_code	= MEDIA_BUS_FMT_Y12_1X12,
+ 		.pixel_enc	= V4L2_PIXEL_ENC_BAYER,
+ 		.mipi_dt	= MIPI_CSI2_DT_RAW12,
+ 		.bayer_pat	= RKISP1_RAW_BGGR,
+--- a/rkisp1-capture.c
++++ b/rkisp1-capture.c
+@@ -235,6 +235,12 @@
+ 		.output_format = RKISP1_CIF_MI_INIT_MP_OUTPUT_RAW10,
+ 		.mbus = MEDIA_BUS_FMT_SBGGR10_1X10,
+ 	}, {
++		.fourcc = V4L2_PIX_FMT_Y10,
++		.byte_swap = 1,
++		.write_format = RKISP1_MI_CTRL_MP_WRITE_RAW12,
++		.output_format = RKISP1_CIF_MI_INIT_MP_OUTPUT_RAW10,
++		.mbus = MEDIA_BUS_FMT_Y10_1X10,
++	}, {
+ 		.fourcc = V4L2_PIX_FMT_SRGGB12,
+ 		.byte_swap = 1,
+ 		.write_format = RKISP1_MI_CTRL_MP_WRITE_RAW12,
+@@ -258,6 +264,12 @@
+ 		.write_format = RKISP1_MI_CTRL_MP_WRITE_RAW12,
+ 		.output_format = RKISP1_CIF_MI_INIT_MP_OUTPUT_RAW12,
+ 		.mbus = MEDIA_BUS_FMT_SBGGR12_1X12,
++	}, {
++		.fourcc = V4L2_PIX_FMT_Y12,
++		.byte_swap = 1,
++		.write_format = RKISP1_MI_CTRL_MP_WRITE_RAW12,
++		.output_format = RKISP1_CIF_MI_INIT_MP_OUTPUT_RAW12,
++		.mbus = MEDIA_BUS_FMT_Y12_1X12,
+ 	},
+ };
+ 
+@@ -1219,7 +1231,16 @@
+ 	u32 stride;
+ 
+ 	memset(pixm->plane_fmt, 0, sizeof(pixm->plane_fmt));
+-	info = v4l2_format_info(pixm->pixelformat);
++	switch (pixm->pixelformat) {
++	case V4L2_PIX_FMT_Y10:
++		info = v4l2_format_info(V4L2_PIX_FMT_SBGGR10);
++		break;
++	case V4L2_PIX_FMT_Y12:
++		info = v4l2_format_info(V4L2_PIX_FMT_SBGGR12);
++		break;
++	default:
++		info = v4l2_format_info(pixm->pixelformat);
++	}
+ 	pixm->num_planes = info->mem_planes;
+ 
+ 	/*
+--- a/rkisp1-csi.c
++++ b/rkisp1-csi.c
+@@ -150,27 +150,34 @@
+ 			    const struct rkisp1_sensor_async *sensor,
+ 			    const struct rkisp1_mbus_info *format)
+ {
+-	struct rkisp1_device *rkisp1 = csi->rkisp1;
+ 	union phy_configure_opts opts;
+ 	struct phy_configure_opts_mipi_dphy *cfg = &opts.mipi_dphy;
+-	s64 pixel_clock;
++	struct media_pad *source;
++	s64 freq;
+ 	int ret;
+ 
+ 	ret = rkisp1_csi_config(csi, sensor, format);
+ 	if (ret)
+ 		return ret;
+ 
+-	pixel_clock = v4l2_ctrl_g_ctrl_int64(sensor->pixel_rate_ctrl);
+-	if (!pixel_clock) {
+-		dev_err(rkisp1->dev, "Invalid pixel rate value\n");
+-		return -EINVAL;
+-	}
+-
+-	phy_mipi_dphy_get_default_config(pixel_clock, format->bus_width,
+-					 sensor->lanes, cfg);
+-	phy_set_mode(csi->dphy, PHY_MODE_MIPI_DPHY);
+-	phy_configure(csi->dphy, &opts);
+-	phy_power_on(csi->dphy);
++	source = media_pad_remote_pad_first(&csi->pads[RKISP1_CSI_PAD_SINK]);
++	if (!source)
++		return -ENOLINK;
++	freq = v4l2_get_link_freq(source, format->bus_width, 2 * sensor->lanes);
++	if (freq <= 0)
++		return freq ? freq : -EINVAL;
++	ret = phy_mipi_dphy_get_default_config_for_hsclk(2 * freq, sensor->lanes, cfg);
++	if (ret)
++		return ret;
++	ret = phy_set_mode(csi->dphy, PHY_MODE_MIPI_DPHY);
++	if (ret)
++		return ret;
++	ret = phy_configure(csi->dphy, &opts);
++	if (ret)
++		return ret;
++	ret = phy_power_on(csi->dphy);
++	if (ret)
++		return ret;
+ 
+ 	rkisp1_csi_enable(csi);
+ 

@@ -8,6 +8,8 @@ build/
 
 # C++ build artifacts & runtime logs
 server/bin/
+drivers/rk3399/.work-*/
+drivers/rk3399/out/
 *.o
 *.log
 

@@ -69,22 +69,48 @@ static bool json_get_u32(const char *json, const char *key, uint32_t *out) {
 }
 
 static int format_status_json(const CameraStatus *s, char *buf, size_t sz) {
+    char modes[96];
+    int mpos = 0;
+    mpos += snprintf(modes + mpos, sizeof(modes) - (size_t)mpos, "[");
+    if (s->h264_supported) {
+        mpos += snprintf(modes + mpos, sizeof(modes) - (size_t)mpos, "\"h264\",");
+    }
+    if (s->mjpeg_supported) {
+        mpos += snprintf(modes + mpos, sizeof(modes) - (size_t)mpos, "\"mjpeg\",");
+    }
+    snprintf(modes + mpos, sizeof(modes) - (size_t)mpos, "\"lossless\",\"preview8\"]");
+
+    char bdepths[32];
+    int bpos = 0;
+    bpos += snprintf(bdepths + bpos, sizeof(bdepths) - (size_t)bpos, "[");
+    bool has12 = (s->format_cap_mask & 0x4u) != 0;
+    bool has10 = (s->format_cap_mask & 0x2u) != 0;
+    if (!has12 && !has10) { has12 = true; has10 = true; }
+    if (has12) bpos += snprintf(bdepths + bpos, sizeof(bdepths) - (size_t)bpos, "12%s", has10 ? "," : "");
+    if (has10) bpos += snprintf(bdepths + bpos, sizeof(bdepths) - (size_t)bpos, "10");
+    snprintf(bdepths + bpos, sizeof(bdepths) - (size_t)bpos, "]");
+
     return snprintf(
         buf, sz,
         "{\"ok\":true,\"status\":{"
+        "\"platform\":\"%s\",\"sensor_type\":\"%s\","
         "\"camera_model\":\"%s\",\"video_dev\":\"%s\",\"subdev_dev\":\"%s\",\"i2c_dev\":\"%s\","
         "\"sensor_width\":%u,\"sensor_height\":%u,\"min_roi_width\":%u,\"min_roi_height\":%u,"
+        "\"available_bit_depths\":%s,"
         "\"bit_depth\":%u,\"roi_x\":%u,\"roi_y\":%u,\"width\":%u,\"height\":%u,\"stride\":%u,"
-        "\"stream_mode\":\"%s\",\"exposure_mode\":\"%s\","
+        "\"stream_mode\":\"%s\",\"available_stream_modes\":%s,\"exposure_mode\":\"%s\","
         "\"target_exposure_us\":%u,\"actual_exposure_us\":%u,"
         "\"gain_mode\":\"%s\",\"target_gain_db\":%.2f,\"actual_gain_db\":%.2f,"
         "\"target_fps\":%.2f,\"effective_fps\":%.2f,\"sensor_max_fps\":%.2f,\"measured_fps\":%.2f,"
         "\"fps_clamped_by_exposure\":%s,"
         "\"frame_seq\":%llu,\"dropped_frames\":%llu,\"streaming\":%s}}\n",
+        s->platform[0] ? s->platform : "unknown",
+        s->sensor_type[0] ? s->sensor_type : "mono",
         s->camera_model, s->video_dev, s->subdev_dev, s->i2c_dev,
         s->sensor_width, s->sensor_height, s->min_roi_width, s->min_roi_height,
+        bdepths,
         s->bit_depth, s->roi_x, s->roi_y, s->width, s->height, s->stride,
-        s->stream_mode, s->exposure_mode,
+        s->stream_mode, modes, s->exposure_mode,
         s->target_exposure_us, s->actual_exposure_us,
         s->gain_mode, s->target_gain_db, s->actual_gain_db,
         s->target_fps, s->effective_fps, s->sensor_max_fps, s->measured_fps,

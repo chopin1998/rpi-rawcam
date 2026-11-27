@@ -184,6 +184,43 @@ class H264Decoder:
         return w, h, w, gray.tobytes()
 
 
+class MjpegDecoder:
+    """Low-latency single-frame JPEG decoder for RK3399 Hantro hardware MJPEG stream."""
+
+    def __init__(self) -> None:
+        self._codec = av.CodecContext.create("mjpeg", "r")
+        self._codec.thread_type = "SLICE"
+        self._codec.flags |= av.codec.context.Flags.low_delay
+
+    def decode_y8(self, jpeg_bytes: bytes, target_w: int, target_h: int) -> tuple[int, int, int, bytes] | None:
+        pkt = av.Packet(jpeg_bytes)
+        try:
+            frames = self._codec.decode(pkt)
+        except Exception:
+            self._codec = av.CodecContext.create("mjpeg", "r")
+            self._codec.thread_type = "SLICE"
+            self._codec.flags |= av.codec.context.Flags.low_delay
+            return None
+        if not frames:
+            return None
+        frame = frames[-1]
+        fmt_name = frame.format.name
+        if fmt_name in ("yuvj420p", "yuv420p", "yuvj422p", "yuv422p", "nv12", "gray"):
+            plane0 = frame.planes[0]
+            stride = plane0.line_size
+            w = min(target_w, frame.width) if target_w > 0 else frame.width
+            h = min(target_h, frame.height) if target_h > 0 else frame.height
+            raw = memoryview(plane0)
+            need = stride * h
+            return w, h, stride, bytes(raw[:need])
+        gray = frame.to_ndarray(format="gray")
+        h, w = gray.shape
+        if target_w > 0 and target_h > 0 and (w > target_w or h > target_h):
+            gray = gray[:target_h, :target_w]
+            h, w = gray.shape
+        return w, h, w, gray.tobytes()
+
+
 class ControlClient:
     """Thread-safe newline-delimited JSON control client (port 5600)."""
 
@@ -338,6 +375,7 @@ class StreamReceiver(QThread):
             return
 
         decoder: H264Decoder | None = None
+        mjpeg_decoder: MjpegDecoder | None = None
         last_h264_dims = (0, 0)
 
         t0 = time.monotonic()
@@ -378,6 +416,20 @@ class StreamReceiver(QThread):
                     hdr.payload_size = len(y_bytes)
                     payload = y_bytes
                     decode_tag = "H264 VA-API" if decoder.hw_active else "H264 SW"
+                elif hdr.pixel_format == PixelFormat.MJPEG:
+                    if mjpeg_decoder is None:
+                        mjpeg_decoder = MjpegDecoder()
+                    dec = mjpeg_decoder.decode_y8(payload, hdr.width, hdr.height)
+                    if dec is None:
+                        continue
+                    dw, dh, dstride, y_bytes = dec
+                    hdr.pixel_format = PixelFormat.Y8_PREVIEW
+                    hdr.width = dw
+                    hdr.height = dh
+                    hdr.stride = dstride
+                    hdr.payload_size = len(y_bytes)
+                    payload = y_bytes
+                    decode_tag = "MJPEG HW"
                 else:
                     decode_tag = "LOSSLESS" if hdr.is_lossless else "PREVIEW-8"
 

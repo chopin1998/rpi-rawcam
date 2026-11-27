@@ -22,6 +22,7 @@ class PixelFormat(IntEnum):
     Y12 = 4         # 12-bit unpacked uint16 LE, lossless
     Y8_PREVIEW = 5  # 8-bit preview (lossy display mode)
     H264 = 6        # Hardware H.264 Annex-B access unit (lossy display mode)
+    MJPEG = 7       # Hardware JPEG / MJPEG frame (lossy display mode)
 
 
 FLAG_LOSSLESS = 1 << 0
@@ -56,7 +57,7 @@ class FrameHeader:
 
     @property
     def max_value(self) -> int:
-        if self.pixel_format in (PixelFormat.Y8_PREVIEW, PixelFormat.H264):
+        if self.pixel_format in (PixelFormat.Y8_PREVIEW, PixelFormat.H264, PixelFormat.MJPEG):
             return 255
         return (1 << self.bit_depth) - 1
 

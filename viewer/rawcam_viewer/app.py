@@ -443,9 +443,8 @@ class MainWindow(QMainWindow):
         view_bar = QHBoxLayout()
         view_bar.addWidget(QLabel("Stream Mode:"))
         self.stream_mode_combo = QComboBox()
-        self.stream_mode_combo.addItem("Hardware H.264 Preview", "h264")
-        self.stream_mode_combo.addItem("Lossless RAW (MIPI Packed)", "lossless")
-        self.stream_mode_combo.addItem("8-bit Uncompressed Preview", "preview8")
+        self._available_stream_modes: list[str] = []
+        self._populate_stream_modes(["h264", "mjpeg", "lossless", "preview8"])
         self.stream_mode_combo.currentIndexChanged.connect(self._on_stream_mode_changed)
         view_bar.addWidget(self.stream_mode_combo)
 
@@ -662,6 +661,7 @@ class MainWindow(QMainWindow):
         fmt_form.setContentsMargins(6, 4, 6, 4)
 
         fmt_top = QHBoxLayout()
+        self._sensor_caps_sig: tuple[int, int, int, int, tuple[int, ...]] | None = None
         self.bit_depth_combo = QComboBox()
         self.bit_depth_combo.addItem("RAW12", 12)
         self.bit_depth_combo.addItem("RAW10", 10)
@@ -1016,7 +1016,12 @@ class MainWindow(QMainWindow):
 
         self._poll_timer.start()
         self.connect_btn.setText("Disconnect")
-        self.status_lbl.setText(f"Connected to {host} ({st.get('camera_model', 'RAWCam')})")
+        sw = int(st.get("sensor_width", st.get("width", 0)))
+        sh = int(st.get("sensor_height", st.get("height", 0)))
+        stype = st.get("sensor_type", "mono")
+        plat = st.get("platform", "")
+        meta = f"{stype}, {sw}×{sh}" + (f", {plat}" if plat else "")
+        self.status_lbl.setText(f"Connected to {host} — {st.get('camera_model', 'RAWCam')} ({meta})")
 
     def _disconnect(self) -> None:
         self._spot_job = None
@@ -1323,6 +1328,82 @@ class MainWindow(QMainWindow):
             "height": self.roi_h_spin.value(),
         }, sync_inputs=True)
 
+    def _sync_sensor_capabilities(self, st: dict[str, Any]) -> None:
+        sw = int(st.get("sensor_width", 0))
+        sh = int(st.get("sensor_height", 0))
+        if sw <= 0 or sh <= 0:
+            return
+        min_w = max(64, int(st.get("min_roi_width", 368)))
+        min_h = max(64, int(st.get("min_roi_height", 304)))
+        raw_bds = st.get("available_bit_depths")
+        if isinstance(raw_bds, list) and raw_bds:
+            bds = tuple(int(b) for b in raw_bds if int(b) in (8, 10, 12, 14, 16))
+        else:
+            bds = (12, 10)
+        if not bds:
+            bds = (12, 10)
+
+        sig = (sw, sh, min_w, min_h, bds)
+        if sig == self._sensor_caps_sig:
+            return
+        self._sensor_caps_sig = sig
+
+        prev_updating = self._updating_ui
+        self._updating_ui = True
+        self.roi_x_spin.setRange(0, max(0, sw - min_w))
+        self.roi_y_spin.setRange(0, max(0, sh - min_h))
+        self.roi_w_spin.setRange(min_w, sw)
+        self.roi_h_spin.setRange(min_h, sh)
+
+        cur_bd = self.bit_depth_combo.currentData()
+        self.bit_depth_combo.clear()
+        for bd in bds:
+            self.bit_depth_combo.addItem(f"RAW{bd}", bd)
+        bd_idx = self.bit_depth_combo.findData(st.get("bit_depth", cur_bd))
+        if bd_idx >= 0:
+            self.bit_depth_combo.setCurrentIndex(bd_idx)
+
+        self.roi_preset_combo.clear()
+        self.roi_preset_combo.addItem(f"Full ({sw}×{sh})", (0, 0, sw, sh))
+        for label, pw, ph in (
+            ("4K", 3840, 2160),
+            ("2K", 2560, 1440),
+            ("1080p", 1920, 1080),
+            ("720p", 1280, 720),
+            ("VGA", 640, 480),
+        ):
+            if min_w <= pw <= sw and min_h <= ph <= sh and (pw, ph) != (sw, sh):
+                ox = (((sw - pw) // 2) // 8) * 8
+                oy = (((sh - ph) // 2) // 4) * 4
+                self.roi_preset_combo.addItem(f"{label} ({pw}×{ph})", (ox, oy, pw, ph))
+        self._updating_ui = prev_updating
+
+    def _populate_stream_modes(self, modes: list[str], current_mode: str | None = None) -> None:
+        labels = {
+            "h264": "Hardware H.264 Preview",
+            "mjpeg": "Hardware MJPEG Preview",
+            "lossless": "Lossless RAW (10/12-bit)",
+            "preview8": "8-bit Uncompressed Preview",
+        }
+        filtered = [m for m in modes if m in labels]
+        if not filtered:
+            filtered = ["lossless", "preview8"]
+        if filtered != self._available_stream_modes:
+            prev_updating = self._updating_ui
+            self._updating_ui = True
+            self.stream_mode_combo.clear()
+            for m in filtered:
+                self.stream_mode_combo.addItem(labels[m], m)
+            self._available_stream_modes = list(filtered)
+            self._updating_ui = prev_updating
+        if current_mode:
+            idx = self.stream_mode_combo.findData(current_mode)
+            if idx >= 0 and self.stream_mode_combo.currentIndex() != idx:
+                prev_updating = self._updating_ui
+                self._updating_ui = True
+                self.stream_mode_combo.setCurrentIndex(idx)
+                self._updating_ui = prev_updating
+
     def _on_stream_mode_changed(self) -> None:
         if self._updating_ui or self._ctrl_worker is None or not self._ctrl.connected:
             return
@@ -1356,6 +1437,19 @@ class MainWindow(QMainWindow):
             self.fps_clamp_lbl.setVisible(False)
 
         self.fps_slider.setMaximum(max(1, int(round(max_fps))))
+
+        self._sync_sensor_capabilities(st)
+
+        avail = st.get("available_stream_modes")
+        cur_mode = st.get("stream_mode", "lossless")
+        if isinstance(avail, list) and avail:
+            modes = [str(m) for m in avail]
+        elif cur_mode == "mjpeg":
+            modes = ["mjpeg", "lossless", "preview8"]
+        else:
+            # Backward compatibility with older RPi servers that omit available_stream_modes
+            modes = ["h264", "lossless", "preview8"]
+        self._populate_stream_modes(modes, current_mode=cur_mode if sync_inputs else None)
 
         if sync_inputs:
             self._updating_ui = True

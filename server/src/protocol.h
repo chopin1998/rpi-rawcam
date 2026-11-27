@@ -16,6 +16,7 @@ typedef enum {
     PIXFMT_Y12        = 4, /* 12-bit unpacked uint16 LE, lossless */
     PIXFMT_Y8_PREVIEW = 5, /* 8-bit top-bit preview (lossy display mode) */
     PIXFMT_H264       = 6, /* Hardware H.264 Annex-B access unit (lossy display mode) */
+    PIXFMT_MJPEG      = 7, /* Hardware JPEG / MJPEG frame (lossy display mode) */
 } PixelFormat;
 
 #define FLAG_LOSSLESS (1u << 0)

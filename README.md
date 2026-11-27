@@ -1,39 +1,87 @@
 # rpi-rawcam
 
-把树莓派上的 MIPI RAW10/12 摄像头做成一个轻量的网络发布服务，配合 PC 端 PySide6 软件做远程预览、参数调节和无损抓拍。
+把单板机上的 MIPI RAW10/12 工业相机做成一套局域网采集服务，配一个桌面端 PySide6 + OpenGL 客户端，方便远程对焦、调参和无损抓拍。
 
-核心思路是**尽量把活交给硬件**：树莓派这边用 Unicam DMA 直接拿 MIPI 打包数据，预览时走片上 VPU 硬件 H.264 编码（省带宽、低 CPU），需要保存或做图像分析时随时拿完整的 10/12-bit 无损 RAW；PC 端用 VA-API 硬解 + OpenGL Shader 直接在显卡里解包、拉伸和显示。
+目前支持 **Raspberry Pi 4B** 和 **Radxa ROCK Pi 4C（RK3399，Mainline Linux）**，两块板子跑同一份服务端代码，客户端连上去自动识别平台、传感器型号、分辨率、位深和硬件编码能力，不需要手工切配置。
 
-> 目前协议和寄存器适配基于 VEYE RAW-MIPI 驱动（已在 IMX462M 模组上验证），结构上不绑定具体型号，后续方便扩展其它传感器。
+---
+
+## 为什么这么做
+
+- **服务端纯 C11，零第三方库依赖**：直接 `gcc` 编译出几十 KB 的单个二进制 `rawcamd`，板端不用装 OpenCV / FFmpeg / Python 环境。
+- **预览走硬件，抓拍拿真 RAW**：
+  - 树莓派（Unicam）：预览走片上 VPU 硬编 H.264（`/dev/video11`），带宽低、延迟小；抓拍/无损流直接拿 Unicam DMA 的 `Y10P`/`Y12P`。
+  - RK3399（Mainline `rkisp1`）：主线内核没有 `rkvenc` H.264 硬编，预览改走片上 Hantro VPU 硬件 JPEG 编码（`/dev/video3`）做单帧独立 MJPEG，1944×1096 @ 30fps 实测仅 **3.2 MB/s**、服务端总 CPU 占用约 **5%**，调焦无帧间涂抹；无损流与抓拍经 ARM NEON 实时转为标准 `Y10`/`Y12`（千兆网实测 108 MB/s 跑满线速）。
+- **预览不断流，随时抓 12-bit 原图**：日常看 H.264 / MJPEG 预览时，点一下 **Snap 12-bit Lossless** 会走独立端口（`5602`）抓当前完整的 10/12-bit 无损帧保存为 16-bit PNG / TIFF / `.raw`。
+- **长曝光单次拍摄**：实时流曝光 0.05 ~ 500 ms（超过当前帧周期自动降帧率，调短自动恢复）；需要更长曝光（最高 10 s）时可走 Single Shot 单拍定格 12-bit 原图，拍完后台自动恢复实时流。
+- **显卡做解包与拉伸**：PC 端用 PySide6 + OpenGL Shader 直接在 GPU 里解包 `Y10P`/`Y12P`/`Y10`/`Y12`、做黑电平/白电平/Gamma 拉伸、伪彩映射和 1:1 像素缩放，支持点选局部自动曝光/增益（Spot Auto）。
+- **可复现的 RK3399 主线驱动方案**：树莓派用官方驱动；RK3399 主线内核的 `veye_mvcam` 加固补丁、`rkisp1` 单色 RAW 旁路补丁和 `rockpi4c-veye.dts` 覆盖层都放在仓库里，不替换原厂内核镜像，支持一键回退。
+
+---
+
+## 硬件与实测情况
+
+目前基于 **VEYE `RAW-MIPI-IMX462M`**（1944×1096 单色 RAW10/12，2-lane 891 Mbps/lane）验证，协议本身不绑死型号，连上后自动读取传感器分辨率、最小 ROI 与位深能力。
+
+| 平台 | 采集后端 | 默认硬件预览 | 实测预览表现（1944×1096） | 无损格式 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Raspberry Pi 4B** | `unicam-image` | VPU H.264 (`/dev/video11`) | 30–60 fps，低码率，PC 端 VA-API 硬解 | `Y10P` / `Y12P` |
+| **ROCK Pi 4C (RK3399)** | `rkisp1_mainpath` | Hantro MJPEG (`/dev/video3`) | 30.4 fps @ 3.17 MB/s（上限 ~46 fps），CPU ~5% | `Y10` / `Y12`（NEON 解包） |
+
+---
 
 ## 目录结构
 
-- `server/`：树莓派端纯 C11 服务（`rawcamd`），无第三方库依赖，`gcc` 直接编译。
-  - `5600` 端口：JSON 参数控制与状态回报（曝光、增益、帧率、ROI、位深、流模式）。
-  - `5601` 端口：视频流（硬件 H.264 / 无损 `Y12P`/`Y10P` / 8-bit 预览）。
-  - `5602` 端口：按需单帧 10/12-bit 无损抓拍 & 长曝光（>500 ms）单次拍摄。
-- `viewer/`：PC 端 PySide6 + OpenGL 客户端（`rawcam-viewer`）。
+```text
+.
+├── server/                        # 板端纯 C11 服务 rawcamd（RPi / RK3399 通用）
+│   ├── src/                       # V4L2/Media 采集、H.264 & MJPEG 硬编、I2C 控制、TCP 服务
+│   ├── camera-driver.sh           # 自动识别平台加载/卸载驱动与设备树覆盖层
+│   ├── start.sh                   # 检查驱动 -> 自动编译 -> 启动 rawcamd
+│   └── rawcam.service             # systemd 开机自启模板
+├── viewer/                        # PC 端 PySide6 + OpenGL 客户端（uv 管理依赖）
+└── drivers/
+    ├── veye_raspberrypi_v4l2/     # Git Submodule：上游 veyeimaging/raspberrypi_v4l2
+    └── rk3399/                    # RK3399 主线内核补丁、DTS、编译/安装/回退脚本
+```
 
-## 部署
+网络端口约定：
+- `5600`：JSON 控制与状态查询（平台、传感器型号、分辨率、支持位深、支持流模式、曝光/增益/帧率/ROI）
+- `5601`：二进制视频流（64 字节 `RAWC` 帧头 + 负载）
+- `5602`：按需单帧 10/12-bit 无损快照 & 长曝光单拍
 
-### 1. 树莓派端
+---
 
-`server/camera-driver.sh` 负责加载/卸载内核驱动和设备树覆盖层（默认从 `~/build/raspberrypi_v4l2` 找编译好的 `.ko` 和 `.dtbo`，可通过 `VEYE_REPO` 环境变量指定路径），`start.sh` 启动前会自动检查并在需要时调用它：
+## 快速部署
+
+拉取仓库时记得带上驱动 Submodule：
 
 ```bash
-git clone https://github.com/chopin1998/rpi-rawcam.git ~/rpi-rawcam
+git clone --recurse-submodules https://github.com/chopin1998/rpi-rawcam.git ~/rpi-rawcam
+```
+
+### 1. 板端启动（树莓派 / RK3399 通用）
+
+**RK3399 首次使用**需先编好树外驱动和 DT Overlay（不改原厂内核/DTB，可随时回退）：
+
+```bash
+cd ~/rpi-rawcam/drivers/rk3399
+./build.sh
+sudo ./install-persistent.sh     # 如需恢复原厂状态：sudo ./rollback.sh
+```
+
+> RK3399（ROCK Pi 4C）相机接口是 **J8203**（紧邻 Micro-HDMI 和 3.5 mm 耳机口），别插到对称的 J8204 DSI 屏接口上（两者 3.3V/GND 引脚一致，插错也能测到 3.3V 但 I2C4 无响应）。
+
+驱动就绪后，树莓派和 RK3399 启动方式完全一致：
+
+```bash
 cd ~/rpi-rawcam/server
 make
 ./start.sh
 ```
 
-手动管理驱动状态：
-
-```bash
-sudo ./camera-driver.sh status   # start / stop / status
-```
-
-如果需要开机自启，可以把 `server/rawcam.service` 改好路径后装进 systemd：
+手动查驱动状态：`sudo ./camera-driver.sh status`（支持 `start | stop | status`）。  
+需要开机自启的话，按实际用户名和路径改一下 `server/rawcam.service` 装进 systemd：
 
 ```bash
 sudo cp server/rawcam.service /etc/systemd/system/
@@ -41,27 +89,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rawcam
 ```
 
-### 2. 远程电脑端（Linux）
+### 2. PC 客户端（Linux）
 
-使用 `uv` 安装依赖并运行（不锁定 Python 版本，默认跟随系统或较新 Python）：
+用 `uv` 安装依赖并启动：
 
 ```bash
-git clone https://github.com/chopin1998/rpi-rawcam.git
 cd rpi-rawcam/viewer
 uv sync
 uv run rawcam-viewer
 ```
 
-## 使用方法
-
-1. 启动 `rawcam-viewer`，顶部填入树莓派 IP，点击 **Connect**。
-2. **流模式切换**：
-   - `Hardware H.264 Preview`（默认）：RPi VPU 硬编 + 本机 VA-API 硬解，带宽低、帧率高，适合日常观察和调焦。
-   - `Lossless RAW (MIPI Packed)`：连续推送完整 10/12-bit 无损数据，本机 GPU Shader 实时解包。
-3. **曝光 / 增益 / 自适应帧率**：
-   - 实时流曝光范围 `0.05 ~ 500 ms`，曝光变长超过当前帧周期时会自动降低帧率，调短后自动恢复到目标帧率。
-   - **Spot Auto**：按住 `Shift + 左键` 点击画面任意位置（或点按钮后点击），程序会按该点附近邻域亮度自动迭代调整曝光或增益。
-4. **长曝光单次拍摄（> 500 ms）**：
-   - 在 **Long Exposure Single Shot** 面板设置曝光（最高 `10000 ms`）和增益，点 **Single Shot (12-bit)**。拍完会定格显示 12-bit 无损原图，树莓派后台自动恢复实时流；点 **Resume Live** 切回实时画面。
-5. **无损抓拍保存**：
-   - 无论当前处于 H.264 预览还是长曝光定格，点击顶部 **Snap 12-bit Lossless** 都会保存真实的 10/12-bit 无损图像（支持 16-bit PNG、16-bit TIFF、原始 `.raw`）。
+顶部输入板子地址（例如 `rp4.local` 或 `rockpi-4c.local`），点 **Connect** 即可：
+- 下拉框会自动隐藏当前主机不支持的预览协议（连树莓派显示 H.264，连 RK3399 显示 MJPEG）。
+- ROI 预设、范围和可选位深按实机传感器能力自动生成。
+- `Shift + 左键` 点击画面任意位置可对该点邻域做 **Spot Auto** 自动调曝光/增益。
+- 任意预览模式下点 **Snap 12-bit Lossless** 都会保存真实的 10/12-bit 无损原图。
