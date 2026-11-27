@@ -7,12 +7,8 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 KVER="$(uname -r)"
 FW=/boot/firmware; [[ -d $FW ]] || FW=/boot
 
-if [[ -f "$FW/config.txt.bak-pre-veye" ]]; then
-    cp -a "$FW/config.txt.bak-pre-veye" "$FW/config.txt"
-    echo "Restored $FW/config.txt from backup."
-else
-    sed -i '/^dtoverlay=veye_mvcam$/d' "$FW/config.txt"
-fi
+# Keep unrelated firmware settings, including edits made after deployment.
+sed -i '/^dtoverlay=veye_mvcam\(,.*\)\?[[:blank:]]*$/d' "$FW/config.txt"
 rm -f "$FW/overlays/veye_mvcam.dtbo" "/lib/modules/$KVER/updates/veye_mvcam.ko"
 depmod -a "$KVER"
 rmmod veye_mvcam 2>/dev/null || true

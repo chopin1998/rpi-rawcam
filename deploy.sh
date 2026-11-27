@@ -24,7 +24,8 @@ for arg in "$@"; do
             cat <<'EOF'
 Usage: ./deploy.sh [options]
   --no-service    Install drivers and build rawcamd, but do not set up the systemd user service
-  --service-only  Only (re)install and start the systemd user service (no root needed)
+  --service-only  (Re)install the systemd user service for an already configured camera
+                  May need sudo to enable linger or disable an old system service
   --force-driver  Rebuild and reinstall kernel modules even if already installed
   --skip-apt      Skip apt-get dependency installation
 EOF
@@ -38,13 +39,36 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
 camera_present() { ls /sys/bus/i2c/devices/*-003b/veye_mvcam >/dev/null 2>&1; }
 
+disable_legacy_service() {
+    if ! systemctl is-active --quiet rawcam.service &&
+       ! systemctl is-enabled --quiet rawcam.service; then
+        return
+    fi
+
+    local fragment
+    fragment=$(systemctl show rawcam.service -p FragmentPath --value)
+    if [[ "$fragment" != /etc/systemd/system/rawcam.service ]] ||
+       ! grep -qE '^ExecStartPre=/.*/server/camera-driver\.sh start$' "$fragment"; then
+        die "A system-level rawcam.service is running or enabled. Review it before starting the user service."
+    fi
+
+    echo "=== Disabling the legacy rawcam system service ==="
+    as_root systemctl disable --now rawcam.service
+}
+
 install_user_service() {
-    (( EUID != 0 )) || die "Run deploy.sh as your normal user, not root (the service runs as a user unit)."
     [[ -x "$REPO_ROOT/server/bin/rawcamd" ]] || make -C "$REPO_ROOT/server"
-    local unit_dir="$HOME/.config/systemd/user"
+    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local unit_root="$REPO_ROOT"
+    # Escape the checkout path for a quoted systemd argument and a sed replacement.
+    unit_root=${unit_root//%/%%}
+    unit_root=${unit_root//\\/\\\\}
+    unit_root=${unit_root//\"/\\\"}
+    unit_root=${unit_root//\\/\\\\}
+    unit_root=${unit_root//&/\\&}
+    unit_root=${unit_root//|/\\|}
     mkdir -p "$unit_dir"
-    sed "s|@REPO_ROOT@|$REPO_ROOT|g" "$REPO_ROOT/server/rawcam.service" > "$unit_dir/rawcam.service"
-    chmod +x "$REPO_ROOT/server/wait-camera.sh"
+    sed "s|@REPO_ROOT@|$unit_root|g" "$REPO_ROOT/server/rawcam.service" > "$unit_dir/rawcam.service"
 
     # Let the user unit start at boot without an interactive login
     if [[ "$(loginctl show-user "$RUN_USER" -p Linger --value 2>/dev/null)" != "yes" ]]; then
@@ -52,13 +76,16 @@ install_user_service() {
     fi
 
     systemctl --user daemon-reload
+    disable_legacy_service
     systemctl --user enable rawcam.service
     systemctl --user restart rawcam.service
-    sleep 1
-    systemctl --user --no-pager status rawcam.service | head -n 8 || true
     echo "Manage with:  systemctl --user {status|restart|stop} rawcam"
-    echo "Logs:         journalctl --user -u rawcam -f"
+    echo "Logs:         journalctl --user-unit=rawcam.service -f"
 }
+
+if (( INSTALL_SERVICE == 1 || SERVICE_ONLY == 1 )); then
+    (( EUID != 0 )) || die "Run deploy.sh from the account that will run rawcam; the script invokes sudo when needed."
+fi
 
 if (( SERVICE_ONLY == 1 )); then
     install_user_service
@@ -116,8 +143,10 @@ fi
 if [[ "$PLATFORM" == "rk3399" ]]; then
     NEED_DRV=$FORCE_DRIVER
     if ! modinfo -k "$KVER" veye_mvcam >/dev/null 2>&1 || \
-       ! modinfo -k "$KVER" rockchip_isp1 >/dev/null 2>&1 || \
-       [[ ! -f /boot/overlay-user/rockpi4c-veye.dtbo ]]; then
+       [[ ! -f "/lib/modules/$KVER/updates/rockchip-isp1.ko" ||
+          ! -f /etc/modules-load.d/veye-csi.conf ||
+          ! -f /boot/overlay-user/rockpi4c-veye.dtbo ]] || \
+       ! grep -qE '^user_overlays=([[:blank:]]*|.*[[:blank:]])rockpi4c-veye([[:blank:]]|$)' /boot/armbianEnv.txt; then
         NEED_DRV=1
     fi
     if (( NEED_DRV == 1 )); then
@@ -132,7 +161,7 @@ else
     NEED_DRV=$FORCE_DRIVER
     if ! modinfo -k "$KVER" veye_mvcam >/dev/null 2>&1 || \
        [[ ! -f "$FW/overlays/veye_mvcam.dtbo" ]] || \
-       ! grep -qE '^dtoverlay=veye_mvcam' "$FW/config.txt"; then
+       ! grep -qE '^dtoverlay=veye_mvcam(,|[[:blank:]]*$)' "$FW/config.txt"; then
         NEED_DRV=1
     fi
     if (( NEED_DRV == 1 )); then
@@ -143,7 +172,7 @@ else
         as_root install -m 0644 "$OUT/veye_mvcam.ko" "/lib/modules/$KVER/updates/veye_mvcam.ko"
         as_root depmod -a "$KVER"
         as_root install -m 0644 "$OUT/veye_mvcam.dtbo" "$FW/overlays/veye_mvcam.dtbo"
-        if ! grep -qE '^dtoverlay=veye_mvcam' "$FW/config.txt"; then
+        if ! grep -qE '^dtoverlay=veye_mvcam(,|[[:blank:]]*$)' "$FW/config.txt"; then
             [[ -f "$FW/config.txt.bak-pre-veye" ]] || as_root cp -a "$FW/config.txt" "$FW/config.txt.bak-pre-veye"
             printf '\n[all]\ndtoverlay=veye_mvcam\n' | as_root tee -a "$FW/config.txt" >/dev/null
             echo "=== Added 'dtoverlay=veye_mvcam' to $FW/config.txt (backup: config.txt.bak-pre-veye) ==="

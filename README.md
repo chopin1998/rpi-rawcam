@@ -39,7 +39,8 @@
 │   ├── src/                       # V4L2/Media 采集、H.264 & MJPEG 硬编、I2C 控制、TCP 服务
 │   ├── camera-driver.sh           # 自动识别平台加载/卸载驱动与设备树覆盖层
 │   ├── start.sh                   # 检查驱动 -> 自动编译 -> 启动 rawcamd
-│   └── rawcam.service             # systemd 开机自启模板
+│   ├── wait-camera.sh            # 等待 VEYE 相机枚举
+│   └── rawcam.service            # systemd 用户级开机自启模板
 ├── viewer/                        # PC 端 PySide6 + OpenGL 客户端（uv 管理依赖）
 └── drivers/
     ├── veye_raspberrypi_v4l2/     # Git Submodule：上游 veyeimaging/raspberrypi_v4l2
@@ -72,13 +73,26 @@ cd ~/rpi-rawcam
 ./deploy.sh                      # 如不想装 systemd 服务：./deploy.sh --no-service
 ```
 
+请以板上的普通用户运行。部署时用 `sudo` 安装驱动和启动覆盖层，并在迁移时停用旧版系统级服务。之后 `rawcamd` 由该用户的 systemd 启动。部署会开启 linger，开机时无需登录。若部署时刚添加 `video` 或 `i2c` 组权限，重启后会话即可使用新权限。
+
+已有驱动和启动覆盖层的板子可运行 `./deploy.sh --service-only` 更新用户级服务。若之前只加载了运行时覆盖层，执行完整的 `./deploy.sh` 写入开机配置。
+
 > **RK3399（ROCK Pi 4C）注意**：
 > - 相机接口是 **J8203**（紧邻 Micro-HDMI 和 3.5 mm 耳机口），别插到对称的 J8204 DSI 屏接口上（两者 3.3V/GND 引脚一致，插错也能测到 3.3V 但 I2C4 无响应）。
-> - RK3399 的驱动和 Overlay 采用树外安装，不替换原厂内核与基础 DTB，随时可一键恢复原厂状态：`sudo ./drivers/rk3399/rollback.sh`。
+> - RK3399 的驱动和 Overlay 采用树外安装。回退前先运行 `systemctl --user disable --now rawcam`，再运行 `sudo ./drivers/rk3399/rollback.sh`。树莓派对应脚本为 `sudo ./drivers/rpi/rollback.sh`。
 
-日常手动启停或查状态：
+查看状态、重启服务或跟踪日志。
 
 ```bash
+systemctl --user status rawcam
+systemctl --user restart rawcam
+journalctl --user-unit=rawcam.service -f
+```
+
+需要前台调试时，先停掉用户级服务，释放相机和监听端口。
+
+```bash
+systemctl --user stop rawcam
 sudo ./server/camera-driver.sh status   # start | stop | status
 ./server/start.sh                       # 前台手动启动 rawcamd
 ```
@@ -93,7 +107,7 @@ uv sync
 uv run rawcam-viewer
 ```
 
-顶部输入板子地址（例如 `rp4.local` 或 `rockpi-4c.local`），点 **Connect** 即可：
+顶部输入板子地址（例如 `marco-rpi4b.local` 或 `rockpi-4c.local`），点 **Connect** 即可：
 - 下拉框会自动隐藏当前主机不支持的预览协议（连树莓派显示 H.264，连 RK3399 显示 MJPEG）。
 - ROI 预设、范围和可选位深按实机传感器能力自动生成。
 - `Shift + 左键` 点击画面任意位置可对该点邻域做 **Spot Auto** 自动调曝光/增益。

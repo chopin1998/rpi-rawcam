@@ -4,9 +4,10 @@
 Description=RAW Camera Streaming Service (rawcamd)
 
 [Service]
-Type=simple
-ExecStartPre=@REPO_ROOT@/server/wait-camera.sh 60
-ExecStart=@REPO_ROOT@/server/bin/rawcamd --ctrl-port 5600 --stream-port 5601 --snap-port 5602
+Type=exec
+ExecStartPre=:"@REPO_ROOT@/server/wait-camera.sh" 60
+ExecStart=:"@REPO_ROOT@/server/bin/rawcamd" --ctrl-port 5600 --stream-port 5601 --snap-port 5602
+TimeoutStartSec=75
 Restart=on-failure
 RestartSec=3
 
